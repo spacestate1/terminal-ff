@@ -1,0 +1,99 @@
+// Render bottom terminal content (for split mode)
+void render_terminal_content_bottom() {
+    if (!term_window_bottom || !term_window_bottom->font) return;
+
+    ScreenCoord pos = wm_calculate_position(&wm, term_window_bottom);
+
+    float line_height = term_window_bottom->font_size.value * 16.0f *
+                        (1.0f + term_window_bottom->line_spacing.value);
+
+    // Define the content area inside the window (respect 9-slice border)
+    float border_padding = term_window_bottom->border_size.size;
+    float content_left   = pos.x + term_window_bottom->text_margins.left + border_padding;
+    float content_right  = pos.x + term_window_bottom->size.width  - term_window_bottom->text_margins.right - border_padding;
+    float content_top    = pos.y + term_window_bottom->text_margins.top + border_padding;
+    float content_bottom = pos.y + term_window_bottom->size.height - term_window_bottom->text_margins.bottom - border_padding;
+
+    float x = content_left;
+    float y = content_top + (line_height * 0.75f);
+
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    // Enable scissor test to clip text to content area
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(
+        (int)content_left,
+        (int)(wm.screen_size.height - content_bottom),
+        (int)(content_right - content_left),
+        (int)(content_bottom - content_top)
+    );
+
+    if (interactive_mode_bottom) {
+        // Calculate how many columns fit horizontally
+        float border_padding_total = term_window_bottom->border_size.size * 2.0f;
+        float usable_w = term_window_bottom->size.width -
+                        term_window_bottom->text_margins.left -
+                        term_window_bottom->text_margins.right -
+                        border_padding_total;
+
+        float char_w = GetAverageCharWidth(term_window_bottom->font, term_window_bottom->font_size.value);
+        int max_cols = (int)(usable_w / char_w);
+
+        if (max_cols > 3) max_cols -= 3;
+        if (max_cols < 20) max_cols = 20;
+        if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+
+        // Calculate rows
+        float vertical_padding = line_height * 0.75f;
+        int max_rows = (int)((content_bottom - content_top - vertical_padding) / line_height);
+        if (max_rows < 1) max_rows = 1;
+        if (max_rows > ANSI_BUFFER_ROWS) max_rows = ANSI_BUFFER_ROWS;
+
+        // Auto-scroll to keep cursor visible
+        int cursor_x_check, cursor_y_check;
+        ansi_get_cursor(&ansi_term_bottom, &cursor_x_check, &cursor_y_check);
+
+        int start_row = 0;
+        if (cursor_y_check > max_rows - 4) {
+            start_row = cursor_y_check - max_rows + 4;
+        }
+        if (start_row < 0) start_row = 0;
+
+        for (int row = 0; row < max_rows; row++) {
+            char line[ANSI_BUFFER_COLS + 1];
+            ansi_get_line(&ansi_term_bottom, start_row + row, line, max_cols + 1);
+
+            if (line[0] != '\0') {
+                RenderText(term_window_bottom->font, line,
+                           x, y,
+                           term_window_bottom->font_size.value,
+                           term_window_bottom->line_spacing.value);
+            }
+            y += line_height;
+        }
+
+        glDisable(GL_SCISSOR_TEST);
+
+        // Render focus indicator in bottom left corner of bottom terminal
+        if (focused_terminal == 1) {
+            float box_size = 20.0f;
+            float box_x = pos.x + 20.0f;
+            float box_y = pos.y + term_window_bottom->size.height - box_size - 20.0f;
+
+            glDisable(GL_TEXTURE_2D);
+            glColor4f(1.0f, 1.0f, 1.0f, 0.9f);
+            glBegin(GL_QUADS);
+            glVertex2f(box_x, box_y);
+            glVertex2f(box_x + box_size, box_y);
+            glVertex2f(box_x + box_size, box_y + box_size);
+            glVertex2f(box_x, box_y + box_size);
+            glEnd();
+            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+
+        return;
+    }
+
+    // Non-interactive mode - minimal implementation for now
+    glDisable(GL_SCISSOR_TEST);
+}

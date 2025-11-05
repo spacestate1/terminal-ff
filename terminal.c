@@ -68,17 +68,27 @@ bool interactive_mode = false;
 double pty_start_time = 0.0;  // Timestamp when PTY was started
 
 // Split terminal state
-bool split_horizontal = false;
-int focused_terminal = 0;  // 0 = left, 1 = right
-Window* term_window_right = NULL;
+bool split_horizontal = false;  // Left/right split
+bool split_vertical = false;     // Top/bottom split
+int focused_terminal = 0;  // 0 = left/top, 1 = right/bottom
+Window* term_window_right = NULL;   // Right terminal (horizontal split)
+Window* term_window_bottom = NULL;  // Bottom terminal (vertical split)
 
-// Right terminal state (for independent split terminal)
+// Right terminal state (for independent split terminal - horizontal split)
 TerminalState terminal_right = {0};
 AnsiTerminal ansi_term_right;
 int pty_master_fd_right = -1;
 pid_t pty_child_pid_right = -1;
 bool interactive_mode_right = false;
 double pty_start_time_right = 0.0;
+
+// Bottom terminal state (for independent split terminal - vertical split)
+TerminalState terminal_bottom = {0};
+AnsiTerminal ansi_term_bottom;
+int pty_master_fd_bottom = -1;
+pid_t pty_child_pid_bottom = -1;
+bool interactive_mode_bottom = false;
+double pty_start_time_bottom = 0.0;
 
 // Context menu
 typedef struct {
@@ -102,9 +112,10 @@ const char* menu_items[] = {
     "Font Size -",
     "Split Vertical",
     "Split Horizontal",
+    "Close Split",
     "Exit"
 };
-#define MENU_ITEM_COUNT 8
+#define MENU_ITEM_COUNT 9
 
 // Function declarations
 GLuint loadTexture(const char* path);
@@ -252,8 +263,8 @@ void start_interactive_shell(const char* cmd) {
     if (pty_child_pid == 0) {
         // Child: becomes the shell / program
 
-        // Create a new session - completely isolated from parent terminal
-        setsid();
+        // forkpty already created a new session and controlling terminal
+        // DO NOT call setsid() - it would detach from the controlling terminal
 
         // The PTY slave is already stdin/stdout/stderr thanks to forkpty
         // Close any other inherited file descriptors
@@ -261,10 +272,23 @@ void start_interactive_shell(const char* cmd) {
             close(fd);
         }
 
-        setenv("TERM", "xterm-256color", 1);
+        // Set terminal type - use xterm for better SSH compatibility
+        setenv("TERM", "xterm", 1);
 
         // Suppress terminal capability warnings during bash startup
         setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
+
+        // Configure terminal attributes for proper SSH operation
+        struct termios tios;
+        if (tcgetattr(STDIN_FILENO, &tios) == 0) {
+            // Enable canonical mode and echo for interactive programs
+            tios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ISIG;
+            // Enable output processing
+            tios.c_oflag |= OPOST | ONLCR;
+            // Set input flags
+            tios.c_iflag |= ICRNL | IXON;
+            tcsetattr(STDIN_FILENO, TCSANOW, &tios);
+        }
 
         if (cmd && *cmd) {
             execlp("sh", "sh", "-c", cmd, (char*)NULL);
@@ -301,6 +325,7 @@ void poll_pty() {
     char buf[4096];
     int read_count = 0;
     const int max_reads = 100; // Prevent infinite loop
+    bool child_exited = false;
 
     for (;;) {
         if (read_count++ > max_reads) {
@@ -329,21 +354,26 @@ void poll_pty() {
             if (!should_filter) {
                 ansi_process_output(&ansi_term, buf, (int)n);
             }
+            // Continue reading to drain any remaining buffered data
         } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // no more data right now
+            // no more data right now - safe to exit if child has exited
+            if (child_exited) {
+                close(pty_master_fd);
+                pty_master_fd = -1;
+                interactive_mode = false;
+                terminal_add_line("[process exited]");
+            }
             break;
         } else if (n == 0) {
-            // child exited - reap the zombie process
+            // child exited - mark it but keep reading buffered data
             if (pty_child_pid > 0) {
                 int status;
                 waitpid(pty_child_pid, &status, WNOHANG);
                 pty_child_pid = -1;
             }
-            close(pty_master_fd);
-            pty_master_fd = -1;
-            interactive_mode = false;
-            terminal_add_line("[process exited]");
-            break;
+            child_exited = true;
+            // Don't close yet - there may be buffered output
+            // Continue reading until EAGAIN
         } else {
             // real error (EIO is common when child exits)
             if (errno != EIO) {
@@ -371,6 +401,7 @@ void poll_pty_right() {
     char buf[4096];
     int read_count = 0;
     const int max_reads = 100;
+    bool child_exited = false;
 
     for (;;) {
         if (read_count++ > max_reads) {
@@ -396,19 +427,24 @@ void poll_pty_right() {
             if (!should_filter) {
                 ansi_process_output(&ansi_term_right, buf, (int)n);
             }
+            // Continue reading to drain buffered data
         } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // no more data - safe to exit if child has exited
+            if (child_exited) {
+                close(pty_master_fd_right);
+                pty_master_fd_right = -1;
+                interactive_mode_right = false;
+            }
             break;
         } else if (n == 0) {
-            // child exited
+            // child exited - mark it but keep reading buffered data
             if (pty_child_pid_right > 0) {
                 int status;
                 waitpid(pty_child_pid_right, &status, WNOHANG);
                 pty_child_pid_right = -1;
             }
-            close(pty_master_fd_right);
-            pty_master_fd_right = -1;
-            interactive_mode_right = false;
-            break;
+            child_exited = true;
+            // Don't close yet - continue reading until EAGAIN
         } else {
             if (errno != EIO) {
                 perror("read pty_right");
@@ -421,6 +457,67 @@ void poll_pty_right() {
             close(pty_master_fd_right);
             pty_master_fd_right = -1;
             interactive_mode_right = false;
+            break;
+        }
+    }
+}
+
+// Poll PTY for bottom terminal
+void poll_pty_bottom() {
+    if (pty_master_fd_bottom < 0) return;
+
+    char buf[4096];
+    int read_count = 0;
+    const int max_reads = 100;
+    bool child_exited = false;
+
+    for (;;) {
+        if (read_count++ > max_reads) break;
+
+        ssize_t n = read(pty_master_fd_bottom, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            bool should_filter = false;
+            double elapsed = glfwGetTime() - pty_start_time_bottom;
+            if (elapsed < 2.0) {
+                if (strstr(buf, "Cannot get terminal settings") != NULL ||
+                    strstr(buf, "SLang_getkey") != NULL ||
+                    strstr(buf, "Assuming EOF on stdin") != NULL ||
+                    strstr(buf, "Failed to open terminal") != NULL) {
+                    should_filter = true;
+                }
+            }
+            if (!should_filter) {
+                ansi_process_output(&ansi_term_bottom, buf, (int)n);
+            }
+            // Continue reading to drain buffered data
+        } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // no more data - safe to exit if child has exited
+            if (child_exited) {
+                close(pty_master_fd_bottom);
+                pty_master_fd_bottom = -1;
+                interactive_mode_bottom = false;
+            }
+            break;
+        } else if (n == 0) {
+            // child exited - mark it but keep reading buffered data
+            if (pty_child_pid_bottom > 0) {
+                int status;
+                waitpid(pty_child_pid_bottom, &status, WNOHANG);
+                pty_child_pid_bottom = -1;
+            }
+            child_exited = true;
+            // Don't close yet - continue reading until EAGAIN
+        } else {
+            if (errno != EIO) perror("read pty_bottom");
+            if (pty_child_pid_bottom > 0) {
+                int status;
+                waitpid(pty_child_pid_bottom, &status, WNOHANG);
+                pty_child_pid_bottom = -1;
+            }
+            close(pty_master_fd_bottom);
+            pty_master_fd_bottom = -1;
+            interactive_mode_bottom = false;
             break;
         }
     }
@@ -605,6 +702,68 @@ void resize_pty_to_window_right() {
         }
         if (pty_child_pid_right > 0) {
             kill(pty_child_pid_right, SIGWINCH);
+        }
+    }
+}
+
+// Resize bottom PTY to match window
+void resize_pty_to_window_bottom() {
+    if (pty_master_fd_bottom < 0 || !term_window_bottom || !term_window_bottom->font) return;
+
+    // Get actual character dimensions from font metrics
+    float char_w = GetAverageCharWidth(term_window_bottom->font, term_window_bottom->font_size.value);
+    float char_h = term_window_bottom->font_size.value * 16.0f * (1.0f + term_window_bottom->line_spacing.value);
+
+    // Text content area inside window (respect margins + border padding)
+    float border_padding = term_window_bottom->border_size.size * 2.0f;
+    float usable_w = term_window_bottom->size.width
+                   - term_window_bottom->text_margins.left
+                   - term_window_bottom->text_margins.right
+                   - border_padding;
+    float usable_h = term_window_bottom->size.height
+                   - term_window_bottom->text_margins.top
+                   - term_window_bottom->text_margins.bottom
+                   - border_padding;
+
+    // Account for vertical padding for first line (0.75 * line_height)
+    float vertical_padding = char_h * 0.75f;
+    usable_h -= vertical_padding;
+
+    int cols = (int)(usable_w / char_w);
+    int rows = (int)(usable_h / char_h);
+
+    // Subtract 3 columns for safety margin (matches rendering calculation)
+    if (cols > 3) cols -= 3;
+
+    // Subtract 2 rows for safety margin to prevent text going below visible area
+    if (rows > 2) rows -= 2;
+
+    if (cols < 20) cols = 20;
+    if (rows < 10) rows = 10;  // Ensure minimum rows for programs like top
+
+    // Don't advertise more than we can store in ansi_term
+    if (cols > ANSI_BUFFER_COLS) cols = ANSI_BUFFER_COLS;
+    if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+
+    struct winsize ws = {
+        .ws_row = rows,
+        .ws_col = cols,
+        .ws_xpixel = 0,
+        .ws_ypixel = 0
+    };
+
+    printf("Bottom PTY size: %d rows × %d cols (usable: %.0f×%.0f, char: %.1f×%.1f)\n",
+           rows, cols, usable_w, usable_h, char_w, char_h);
+    fflush(stdout);
+
+    // Check if pty_master_fd_bottom is a valid terminal before ioctl
+    if (isatty(pty_master_fd_bottom)) {
+        if (ioctl(pty_master_fd_bottom, TIOCSWINSZ, &ws) < 0) {
+            // Silently handle ioctl failures - PTY may not support it yet
+            // or may be in an intermediate state
+        }
+        if (pty_child_pid_bottom > 0) {
+            kill(pty_child_pid_bottom, SIGWINCH);
         }
     }
 }
@@ -885,6 +1044,19 @@ void terminal_execute_command(const char* cmd) {
         start_interactive_shell(cmd);
         return;
     } else if (strncmp(cmd, "more ", 5) == 0 || strcmp(cmd, "more") == 0) {
+        start_interactive_shell(cmd);
+        return;
+    } else if (strncmp(cmd, "ssh ", 4) == 0 || strcmp(cmd, "ssh") == 0) {
+        // ssh needs interactive PTY for password prompts
+        start_interactive_shell(cmd);
+        return;
+    } else if (strncmp(cmd, "sudo ", 5) == 0) {
+        // sudo needs interactive PTY for password prompts
+        start_interactive_shell(cmd);
+        return;
+    } else if (strcmp(cmd, "python") == 0 || strcmp(cmd, "python3") == 0 ||
+               strncmp(cmd, "python ", 7) == 0 || strncmp(cmd, "python3 ", 8) == 0) {
+        // python REPL or scripts may need interactive input
         start_interactive_shell(cmd);
         return;
     } else {
@@ -1228,6 +1400,43 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         return;
     }
 
+    // Control key handling for interactive mode (Ctrl+C, Ctrl+D, Ctrl+Z)
+    if (mods & GLFW_MOD_CONTROL) {
+        char control_char = 0;
+
+        if (key == GLFW_KEY_C) {
+            control_char = 0x03;  // Ctrl+C (SIGINT)
+        } else if (key == GLFW_KEY_D) {
+            control_char = 0x04;  // Ctrl+D (EOF)
+        } else if (key == GLFW_KEY_Z) {
+            control_char = 0x1A;  // Ctrl+Z (SIGTSTP)
+        }
+
+        if (control_char != 0) {
+            // Route to appropriate terminal in split mode
+            if (split_horizontal) {
+                if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
+                    write(pty_master_fd, &control_char, 1);
+                    return;
+                } else if (focused_terminal == 1 && interactive_mode_right && pty_master_fd_right >= 0) {
+                    write(pty_master_fd_right, &control_char, 1);
+                    return;
+                }
+            } else if (split_vertical) {
+                if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
+                    write(pty_master_fd, &control_char, 1);
+                    return;
+                } else if (focused_terminal == 1 && interactive_mode_bottom && pty_master_fd_bottom >= 0) {
+                    write(pty_master_fd_bottom, &control_char, 1);
+                    return;
+                }
+            } else if (interactive_mode && pty_master_fd >= 0) {
+                write(pty_master_fd, &control_char, 1);
+                return;
+            }
+        }
+    }
+
     // Interactive mode - send all keys to PTY (including ESC for vim)
     // In split mode, route to focused terminal
     if (split_horizontal) {
@@ -1288,6 +1497,68 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
                 result = write(fd, seq, strlen(seq));
                 if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("write to right pty");
+                }
+            }
+            return;
+        }
+    } else if (split_vertical) {
+        if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
+            send_key_to_pty(key);
+            return;
+        } else if (focused_terminal == 1 && interactive_mode_bottom && pty_master_fd_bottom >= 0) {
+            // Send to bottom terminal PTY
+            const char *seq = NULL;
+            char c;
+            ssize_t result;
+            int fd = pty_master_fd_bottom;
+
+            switch (key) {
+                case GLFW_KEY_ESCAPE:
+                    c = 0x1b;
+                    result = write(fd, &c, 1);
+                    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        perror("write to bottom pty");
+                    }
+                    return;
+                case GLFW_KEY_ENTER:
+                    c = '\r';
+                    result = write(fd, &c, 1);
+                    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        perror("write to bottom pty");
+                    }
+                    return;
+                case GLFW_KEY_BACKSPACE:
+                    c = 0x7f;
+                    result = write(fd, &c, 1);
+                    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        perror("write to bottom pty");
+                    }
+                    return;
+                case GLFW_KEY_TAB:
+                    c = '\t';
+                    result = write(fd, &c, 1);
+                    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        perror("write to bottom pty");
+                    }
+                    return;
+
+                // Arrow keys
+                case GLFW_KEY_UP:    seq = "\x1b[A"; break;
+                case GLFW_KEY_DOWN:  seq = "\x1b[B"; break;
+                case GLFW_KEY_RIGHT: seq = "\x1b[C"; break;
+                case GLFW_KEY_LEFT:  seq = "\x1b[D"; break;
+
+                // Home/End/Page keys
+                case GLFW_KEY_HOME:      seq = "\x1b[H"; break;
+                case GLFW_KEY_END:       seq = "\x1b[F"; break;
+                case GLFW_KEY_PAGE_UP:   seq = "\x1b[5~"; break;
+                case GLFW_KEY_PAGE_DOWN: seq = "\x1b[6~"; break;
+            }
+
+            if (seq) {
+                result = write(fd, seq, strlen(seq));
+                if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    perror("write to bottom pty");
                 }
             }
             return;
@@ -1492,6 +1763,40 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
                     close(pty_master_fd_right);
                     pty_master_fd_right = -1;
                     interactive_mode_right = false;
+                }
+            }
+            return;
+        }
+    } else if (split_vertical) {
+        char utf8[4];
+        int len = 0;
+
+        // Only ASCII for now
+        if (codepoint < 128) {
+            utf8[0] = (char)codepoint;
+            len = 1;
+        } else {
+            return;
+        }
+
+        if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
+            ssize_t result = write(pty_master_fd, utf8, len);
+            if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (errno == EIO || errno == EBADF) {
+                    close(pty_master_fd);
+                    pty_master_fd = -1;
+                    interactive_mode = false;
+                    terminal_add_line("[pty closed]");
+                }
+            }
+            return;
+        } else if (focused_terminal == 1 && interactive_mode_bottom && pty_master_fd_bottom >= 0) {
+            ssize_t result = write(pty_master_fd_bottom, utf8, len);
+            if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (errno == EIO || errno == EBADF) {
+                    close(pty_master_fd_bottom);
+                    pty_master_fd_bottom = -1;
+                    interactive_mode_bottom = false;
                 }
             }
             return;
@@ -1869,6 +2174,101 @@ void render_terminal_content_right() {
     glDisable(GL_SCISSOR_TEST);
 }
 
+// Render bottom terminal content (for split mode)
+void render_terminal_content_bottom() {
+    if (!term_window_bottom || !term_window_bottom->font) return;
+
+    ScreenCoord pos = wm_calculate_position(&wm, term_window_bottom);
+
+    float line_height = term_window_bottom->font_size.value * 16.0f *
+                        (1.0f + term_window_bottom->line_spacing.value);
+
+    // Define the content area inside the window (respect 9-slice border)
+    float border_padding = term_window_bottom->border_size.size;
+    float content_left   = pos.x + term_window_bottom->text_margins.left + border_padding;
+    float content_right  = pos.x + term_window_bottom->size.width  - term_window_bottom->text_margins.right - border_padding;
+    float content_top    = pos.y + term_window_bottom->text_margins.top + border_padding;
+    float content_bottom = pos.y + term_window_bottom->size.height - term_window_bottom->text_margins.bottom - border_padding;
+
+    float x = content_left;
+    float y = content_top + (line_height * 0.75f);
+
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    // Enable scissor test to clip text to content area
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(
+        (int)content_left,
+        (int)(wm.screen_size.height - content_bottom),
+        (int)(content_right - content_left),
+        (int)(content_bottom - content_top)
+    );
+
+    // Interactive mode
+    if (interactive_mode_bottom) {
+        float border_padding_total = term_window_bottom->border_size.size * 2.0f;
+        float usable_w = term_window_bottom->size.width -
+                        term_window_bottom->text_margins.left -
+                        term_window_bottom->text_margins.right -
+                        border_padding_total;
+
+        float char_w = GetAverageCharWidth(term_window_bottom->font, term_window_bottom->font_size.value);
+        int max_cols = (int)(usable_w / char_w);
+
+        if (max_cols > 3) max_cols -= 3;
+        if (max_cols < 20) max_cols = 20;
+        if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+
+        float vertical_padding = line_height * 0.75f;
+        int max_rows = (int)((content_bottom - content_top - vertical_padding) / line_height);
+        if (max_rows < 1) max_rows = 1;
+        if (max_rows > ANSI_BUFFER_ROWS) max_rows = ANSI_BUFFER_ROWS;
+
+        int cursor_x_check, cursor_y_check;
+        ansi_get_cursor(&ansi_term_bottom, &cursor_x_check, &cursor_y_check);
+
+        int start_row = 0;
+        if (cursor_y_check > max_rows - 4) {
+            start_row = cursor_y_check - max_rows + 4;
+        }
+        if (start_row < 0) start_row = 0;
+
+        for (int row = 0; row < max_rows; row++) {
+            char line[ANSI_BUFFER_COLS + 1];
+            ansi_get_line(&ansi_term_bottom, start_row + row, line, max_cols + 1);
+
+            if (line[0] != '\0') {
+                RenderText(term_window_bottom->font, line,
+                           x, y,
+                           term_window_bottom->font_size.value,
+                           term_window_bottom->line_spacing.value);
+            }
+            y += line_height;
+        }
+
+        glDisable(GL_SCISSOR_TEST);
+
+        // Render focus indicator
+        if (focused_terminal == 1) {
+            float box_size = 20.0f;
+            float box_x = pos.x + 20.0f;
+            float box_y = pos.y + term_window_bottom->size.height - box_size - 20.0f;
+
+            glDisable(GL_TEXTURE_2D);
+            glColor4f(1.0f, 1.0f, 1.0f, 0.9f);
+            glBegin(GL_QUADS);
+            glVertex2f(box_x, box_y);
+            glVertex2f(box_x + box_size, box_y);
+            glVertex2f(box_x + box_size, box_y + box_size);
+            glVertex2f(box_x, box_y + box_size);
+            glEnd();
+            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
+}
+
 // Mouse position callback
 void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
     (void)window;
@@ -1949,6 +2349,33 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                 printf("Focus switched to RIGHT terminal\n");
                 fflush(stdout);
             }
+        } else if (split_vertical && term_window && term_window_bottom) {
+            double mouse_x = context_menu.mouse_x;
+            double mouse_y = context_menu.mouse_y;
+
+            // Get window bounds for both terminals
+            ScreenCoord top_pos = wm_calculate_position(&wm, term_window);
+            ScreenCoord bottom_pos = wm_calculate_position(&wm, term_window_bottom);
+
+            bool clicked_top = (mouse_x >= top_pos.x &&
+                               mouse_x <= top_pos.x + term_window->size.width &&
+                               mouse_y >= top_pos.y &&
+                               mouse_y <= top_pos.y + term_window->size.height);
+
+            bool clicked_bottom = (mouse_x >= bottom_pos.x &&
+                                  mouse_x <= bottom_pos.x + term_window_bottom->size.width &&
+                                  mouse_y >= bottom_pos.y &&
+                                  mouse_y <= bottom_pos.y + term_window_bottom->size.height);
+
+            if (clicked_top && focused_terminal != 0) {
+                focused_terminal = 0;
+                printf("Focus switched to TOP terminal\n");
+                fflush(stdout);
+            } else if (clicked_bottom && focused_terminal != 1) {
+                focused_terminal = 1;
+                printf("Focus switched to BOTTOM terminal\n");
+                fflush(stdout);
+            }
         }
 
         if (context_menu.visible) {
@@ -2023,7 +2450,60 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                         break;
                     case 5:  // Split Vertical
                         printf("Split Vertical selected\n");
-                        if (!split_horizontal) {
+                        if (split_horizontal) {
+                            // Already split vertically (left/right) -> UNSPLIT
+                            printf("Unsplitting vertical split...\n");
+
+                            // Close right terminal PTY
+                            if (pty_master_fd_right >= 0) {
+                                close(pty_master_fd_right);
+                                pty_master_fd_right = -1;
+                            }
+
+                            // Kill right terminal child process
+                            if (pty_child_pid_right > 0) {
+                                kill(pty_child_pid_right, SIGTERM);
+                                waitpid(pty_child_pid_right, NULL, WNOHANG);
+                                pty_child_pid_right = -1;
+                            }
+
+                            // Free right terminal font
+                            if (term_window_right && term_window_right->font) {
+                                FreeFont(term_window_right->font);
+                                term_window_right->font = NULL;
+                            }
+
+                            // Hide right window
+                            if (term_window_right) {
+                                wm_hide_window(&wm, term_window_right->name);
+                                term_window_right = NULL;
+                            }
+
+                            // Reset split flag and focus
+                            split_horizontal = false;
+                            interactive_mode_right = false;
+                            focused_terminal = 0;
+
+                            // Get current window size
+                            int current_width, current_height;
+                            glfwGetWindowSize(window, &current_width, &current_height);
+
+                            // Restore main terminal to full size
+                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
+                            term_window->anchor = ANCHOR_CENTER;
+                            term_window->position = SCREEN_COORD(0, 0);
+
+                            // Rewrap main terminal content for new width
+                            rewrap_terminal_content();
+
+                            // Resize PTY
+                            resize_pty_to_window();
+
+                            printf("Vertical split disabled - returned to single terminal\n");
+                        } else if (split_vertical) {
+                            printf("Cannot split: terminal is already split horizontally\n");
+                        } else {
+                            // Not split -> Split vertically (left/right)
                             split_horizontal = true;
                             focused_terminal = 0;
 
@@ -2042,6 +2522,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->position = SCREEN_COORD(WINDOW_EDGE_PADDING, 0);
                             term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
                                                                     TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            term_window->center_alpha = 0.9f;
 
                             // Rewrap left terminal content for new width
                             rewrap_terminal_content();
@@ -2087,11 +2568,21 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 
                             pty_child_pid_right = forkpty(&pty_master_fd_right, NULL, NULL, &ws);
                             if (pty_child_pid_right == 0) {
-                                // Child process
-                                setsid();
+                                // Child process - forkpty already created session and controlling terminal
+                                // DO NOT call setsid()
                                 for (int fd = 3; fd < 256; fd++) close(fd);
-                                setenv("TERM", "xterm-256color", 1);
+                                setenv("TERM", "xterm", 1);
                                 setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
+
+                                // Configure terminal for SSH compatibility
+                                struct termios tios;
+                                if (tcgetattr(STDIN_FILENO, &tios) == 0) {
+                                    tios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ISIG;
+                                    tios.c_oflag |= OPOST | ONLCR;
+                                    tios.c_iflag |= ICRNL | IXON;
+                                    tcsetattr(STDIN_FILENO, TCSANOW, &tios);
+                                }
+
                                 execlp("bash", "bash", "-i", (char*)NULL);
                                 perror("execlp right terminal");
                                 _exit(1);
@@ -2114,9 +2605,266 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                         break;
                     case 6:  // Split Horizontal
                         printf("Split Horizontal selected\n");
-                        // TODO: Implement horizontal split functionality
+                        if (split_vertical) {
+                            // Already split horizontally (top/bottom) -> UNSPLIT
+                            printf("Unsplitting horizontal split...\n");
+
+                            // Close bottom terminal PTY
+                            if (pty_master_fd_bottom >= 0) {
+                                close(pty_master_fd_bottom);
+                                pty_master_fd_bottom = -1;
+                            }
+
+                            // Kill bottom terminal child process
+                            if (pty_child_pid_bottom > 0) {
+                                kill(pty_child_pid_bottom, SIGTERM);
+                                waitpid(pty_child_pid_bottom, NULL, WNOHANG);
+                                pty_child_pid_bottom = -1;
+                            }
+
+                            // Free bottom terminal font
+                            if (term_window_bottom && term_window_bottom->font) {
+                                FreeFont(term_window_bottom->font);
+                                term_window_bottom->font = NULL;
+                            }
+
+                            // Hide bottom window
+                            if (term_window_bottom) {
+                                wm_hide_window(&wm, term_window_bottom->name);
+                                term_window_bottom = NULL;
+                            }
+
+                            // Reset split flag and focus
+                            split_vertical = false;
+                            interactive_mode_bottom = false;
+                            focused_terminal = 0;
+
+                            // Get current window size
+                            int current_width, current_height;
+                            glfwGetWindowSize(window, &current_width, &current_height);
+
+                            // Restore main terminal to full size
+                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
+                            term_window->anchor = ANCHOR_CENTER;
+                            term_window->position = SCREEN_COORD(0, 0);
+
+                            // Rewrap main terminal content for new width
+                            rewrap_terminal_content();
+
+                            // Resize PTY
+                            resize_pty_to_window();
+
+                            printf("Horizontal split disabled - returned to single terminal\n");
+                        } else if (split_horizontal) {
+                            printf("Cannot split: terminal is already split vertically\n");
+                        } else {
+                            // Not split -> Split horizontally (top/bottom)
+                            split_vertical = true;
+                            focused_terminal = 0;
+
+                            // Get current window size
+                            int current_width, current_height;
+                            glfwGetWindowSize(window, &current_width, &current_height);
+
+                            // Calculate usable area and split sizes
+                            int usable_width = current_width - (WINDOW_EDGE_PADDING * 2);
+                            int usable_height = current_height - (WINDOW_EDGE_PADDING * 2);
+                            int half_height = (usable_height - TERMINAL_GAP) / 2;
+
+                            // Resize top window
+                            term_window->size = WINDOW_SIZE(usable_width, half_height);
+                            term_window->anchor = ANCHOR_TOP_CENTER;
+                            term_window->position = SCREEN_COORD(0, WINDOW_EDGE_PADDING);
+                            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
+                                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            term_window->center_alpha = 0.9f;
+
+                            // Rewrap top terminal content for new height
+                            rewrap_terminal_content();
+
+                            // Create bottom terminal window
+                            WindowID bottom_id = wm_create_window(&wm, window_name_from_string("terminal_bottom"));
+                            term_window_bottom = &wm.windows[bottom_id.value];
+
+                            // Configure bottom window
+                            term_window_bottom->anchor = ANCHOR_BOTTOM_CENTER;
+                            term_window_bottom->position = SCREEN_COORD(0, -WINDOW_EDGE_PADDING);
+                            term_window_bottom->size = WINDOW_SIZE(usable_width, half_height);
+                            term_window_bottom->texture_path = font_path_from_string("assets/ui/9-slice-basice9.png");
+                            term_window_bottom->text_color = TEXT_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
+                            term_window_bottom->font_size = FONT_SIZE(1.0f);
+                            term_window_bottom->border_size = BORDER_SIZE(8);
+                            term_window_bottom->line_spacing = LINE_SPACING(0.30f);
+                            term_window_bottom->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
+                                                                           TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            term_window_bottom->center_alpha = 0.9f;
+
+                            // CRITICAL: Load separate font for bottom terminal to prevent double-free
+                            term_window_bottom->font = LoadFont("assets/fonts/font_basis33.json",
+                                                               "assets/fonts/font_basis33.png");
+                            if (!term_window_bottom->font) {
+                                fprintf(stderr, "Failed to load font for bottom terminal\n");
+                            }
+
+                            // Initialize bottom terminal
+                            ansi_init(&ansi_term_bottom);
+                            terminal_bottom.line_count = 0;
+                            terminal_bottom.scroll_offset = 0;
+                            terminal_bottom.cursor_pos = 0;
+                            terminal_bottom.input_buffer[0] = '\0';
+
+                            // Start separate shell for bottom terminal
+                            struct winsize ws = {
+                                .ws_row = ANSI_BUFFER_ROWS,
+                                .ws_col = ANSI_BUFFER_COLS,
+                                .ws_xpixel = 0,
+                                .ws_ypixel = 0
+                            };
+
+                            pty_child_pid_bottom = forkpty(&pty_master_fd_bottom, NULL, NULL, &ws);
+                            if (pty_child_pid_bottom == 0) {
+                                // Child process - forkpty already created session and controlling terminal
+                                // DO NOT call setsid()
+                                for (int fd = 3; fd < 256; fd++) close(fd);
+                                setenv("TERM", "xterm", 1);
+                                setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
+
+                                // Configure terminal for SSH compatibility
+                                struct termios tios;
+                                if (tcgetattr(STDIN_FILENO, &tios) == 0) {
+                                    tios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ISIG;
+                                    tios.c_oflag |= OPOST | ONLCR;
+                                    tios.c_iflag |= ICRNL | IXON;
+                                    tcsetattr(STDIN_FILENO, TCSANOW, &tios);
+                                }
+
+                                execlp("bash", "bash", "-i", (char*)NULL);
+                                perror("execlp bottom terminal");
+                                _exit(1);
+                            } else {
+                                // Parent: set non-blocking
+                                int flags = fcntl(pty_master_fd_bottom, F_GETFL, 0);
+                                if (flags >= 0) {
+                                    fcntl(pty_master_fd_bottom, F_SETFL, flags | O_NONBLOCK);
+                                }
+                                interactive_mode_bottom = true;
+                                pty_start_time_bottom = glfwGetTime();
+
+                                // Set correct terminal size for the bottom PTY
+                                resize_pty_to_window_bottom();
+                            }
+
+                            wm_show_window(&wm, term_window_bottom->name);
+                            printf("Horizontal split enabled - two independent terminals (top/bottom)\n");
+                        }
                         break;
-                    case 7:  // Exit
+                    case 7:  // Close Split
+                        printf("Close Split selected\n");
+                        if (split_horizontal) {
+                            // Close vertical split (left/right)
+                            printf("Closing vertical split...\n");
+
+                            // Close right terminal PTY
+                            if (pty_master_fd_right >= 0) {
+                                close(pty_master_fd_right);
+                                pty_master_fd_right = -1;
+                            }
+
+                            // Kill right terminal child process
+                            if (pty_child_pid_right > 0) {
+                                kill(pty_child_pid_right, SIGTERM);
+                                waitpid(pty_child_pid_right, NULL, WNOHANG);
+                                pty_child_pid_right = -1;
+                            }
+
+                            // Free right terminal font
+                            if (term_window_right && term_window_right->font) {
+                                FreeFont(term_window_right->font);
+                                term_window_right->font = NULL;
+                            }
+
+                            // Hide right window
+                            if (term_window_right) {
+                                wm_hide_window(&wm, term_window_right->name);
+                                term_window_right = NULL;
+                            }
+
+                            // Reset split flag and focus
+                            split_horizontal = false;
+                            interactive_mode_right = false;
+                            focused_terminal = 0;
+
+                            // Get current window size
+                            int current_width, current_height;
+                            glfwGetWindowSize(window, &current_width, &current_height);
+
+                            // Restore main terminal to full size
+                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
+                            term_window->anchor = ANCHOR_CENTER;
+                            term_window->position = SCREEN_COORD(0, 0);
+
+                            // Rewrap main terminal content for new width
+                            rewrap_terminal_content();
+
+                            // Resize PTY
+                            resize_pty_to_window();
+
+                            printf("Vertical split closed - returned to single terminal\n");
+                        } else if (split_vertical) {
+                            // Close horizontal split (top/bottom)
+                            printf("Closing horizontal split...\n");
+
+                            // Close bottom terminal PTY
+                            if (pty_master_fd_bottom >= 0) {
+                                close(pty_master_fd_bottom);
+                                pty_master_fd_bottom = -1;
+                            }
+
+                            // Kill bottom terminal child process
+                            if (pty_child_pid_bottom > 0) {
+                                kill(pty_child_pid_bottom, SIGTERM);
+                                waitpid(pty_child_pid_bottom, NULL, WNOHANG);
+                                pty_child_pid_bottom = -1;
+                            }
+
+                            // Free bottom terminal font
+                            if (term_window_bottom && term_window_bottom->font) {
+                                FreeFont(term_window_bottom->font);
+                                term_window_bottom->font = NULL;
+                            }
+
+                            // Hide bottom window
+                            if (term_window_bottom) {
+                                wm_hide_window(&wm, term_window_bottom->name);
+                                term_window_bottom = NULL;
+                            }
+
+                            // Reset split flag and focus
+                            split_vertical = false;
+                            interactive_mode_bottom = false;
+                            focused_terminal = 0;
+
+                            // Get current window size
+                            int current_width, current_height;
+                            glfwGetWindowSize(window, &current_width, &current_height);
+
+                            // Restore main terminal to full size
+                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
+                            term_window->anchor = ANCHOR_CENTER;
+                            term_window->position = SCREEN_COORD(0, 0);
+
+                            // Rewrap main terminal content for new width
+                            rewrap_terminal_content();
+
+                            // Resize PTY
+                            resize_pty_to_window();
+
+                            printf("Horizontal split closed - returned to single terminal\n");
+                        } else {
+                            printf("No split to close - already in single terminal mode\n");
+                        }
+                        break;
+                    case 8:  // Exit
                         glfwSetWindowShouldClose(window, GLFW_TRUE);
                         break;
                 }
@@ -2219,18 +2967,40 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
 
     // Update terminal window sizes
     if (split_horizontal) {
-        // Recalculate split sizes
+        // Recalculate horizontal split sizes (left/right)
         int usable_width = width - (WINDOW_EDGE_PADDING * 2);
         int usable_height = height - (WINDOW_EDGE_PADDING * 2);
         int half_width = (usable_width - TERMINAL_GAP) / 2;
 
         if (term_window) {
             term_window->size = WINDOW_SIZE(half_width, usable_height);
+            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
+                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
             // Rewrap left terminal content for new width
             rewrap_terminal_content();
         }
         if (term_window_right) {
             term_window_right->size = WINDOW_SIZE(half_width, usable_height);
+            term_window_right->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
+                                                          TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+        }
+    } else if (split_vertical) {
+        // Recalculate vertical split sizes (top/bottom)
+        int usable_width = width - (WINDOW_EDGE_PADDING * 2);
+        int usable_height = height - (WINDOW_EDGE_PADDING * 2);
+        int half_height = (usable_height - TERMINAL_GAP) / 2;
+
+        if (term_window) {
+            term_window->size = WINDOW_SIZE(usable_width, half_height);
+            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
+                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+            // Rewrap top terminal content for new height
+            rewrap_terminal_content();
+        }
+        if (term_window_bottom) {
+            term_window_bottom->size = WINDOW_SIZE(usable_width, half_height);
+            term_window_bottom->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
+                                                           TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
         }
     } else {
         // Single terminal mode
@@ -2248,6 +3018,8 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
     resize_pty_to_window();
     if (split_horizontal) {
         resize_pty_to_window_right();
+    } else if (split_vertical) {
+        resize_pty_to_window_bottom();
     }
 
     printf("Window resized to: %dx%d\n", width, height);
@@ -2343,19 +3115,28 @@ int main(int argc, char** argv) {
         float delta_time = (float)(current_time - last_time);
         last_time = current_time;
 
-        // Update cursor blink
+        // Update cursor blink for all terminals
         terminal.cursor_blink_timer += delta_time;
         if (terminal.cursor_blink_timer > 0.5f) {
             terminal.cursor_visible = !terminal.cursor_visible;
             terminal.cursor_blink_timer = 0.0f;
+
+            // Also update split terminal cursors
+            if (split_horizontal) {
+                terminal_right.cursor_visible = !terminal_right.cursor_visible;
+            } else if (split_vertical) {
+                terminal_bottom.cursor_visible = !terminal_bottom.cursor_visible;
+            }
         }
 
         // Poll PTY for output
         poll_pty();
 
-        // Poll right terminal PTY if split
+        // Poll second terminal PTY if split
         if (split_horizontal) {
             poll_pty_right();
+        } else if (split_vertical) {
+            poll_pty_bottom();
         }
 
         // Clear screen
@@ -2368,9 +3149,11 @@ int main(int argc, char** argv) {
         // Render terminal content on top
         render_terminal_content();
 
-        // Render right terminal if split
+        // Render second terminal if split
         if (split_horizontal) {
             render_terminal_content_right();
+        } else if (split_vertical) {
+            render_terminal_content_bottom();
         }
 
         // Render context menu (if visible)

@@ -577,12 +577,22 @@ void ansi_get_line(AnsiTerminal* term, int row, char* output, int max_len) {
     for (int x = 0; x < ANSI_BUFFER_COLS && len < max_len - 1; x++) {
         char c = term->buffer[row][x].character;
         if (c == 0) c = ' ';
-        output[len++] = c;
+
+        // If cursor is visible and at this position, render cursor instead
+        if (term->cursor_visible && term->cursor_y == row && term->cursor_x == x) {
+            output[len++] = '_';  // Render cursor as underscore
+        } else {
+            output[len++] = c;
+        }
     }
 
-    // Trim trailing spaces
-    while (len > 0 && output[len - 1] == ' ') {
-        len--;
+    // Trim trailing spaces (but not if cursor is at the end)
+    bool cursor_at_end = (term->cursor_visible && term->cursor_y == row &&
+                          term->cursor_x >= len - 1);
+    if (!cursor_at_end) {
+        while (len > 0 && output[len - 1] == ' ') {
+            len--;
+        }
     }
 
     output[len] = '\0';
