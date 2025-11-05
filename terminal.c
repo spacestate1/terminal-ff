@@ -72,7 +72,7 @@ typedef struct {
 ContextMenu context_menu = {false, 0, 0, -1, 0, 0, 22.0f};  // Default offset = 22
 
 #define MENU_ITEM_HEIGHT 30.0f
-#define MENU_WIDTH 180.0f
+#define MENU_WIDTH 280.0f
 
 const char* menu_items[] = {
     "Copy",
@@ -80,9 +80,11 @@ const char* menu_items[] = {
     "Clear Screen",
     "Font Size +",
     "Font Size -",
+    "Split Vertical",
+    "Split Horizontal",
     "Exit"
 };
-#define MENU_ITEM_COUNT 6
+#define MENU_ITEM_COUNT 8
 
 // Function declarations
 GLuint loadTexture(const char* path);
@@ -1433,8 +1435,42 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                         printf("Copy selected\n");
                         break;
                     case 1:  // Paste
-                        // TODO: Implement clipboard paste
-                        printf("Paste selected\n");
+                        {
+                            const char* clipboard_text = glfwGetClipboardString(window);
+                            if (clipboard_text && clipboard_text[0] != '\0') {
+                                if (interactive_mode && pty_master_fd >= 0) {
+                                    // In PTY mode, write clipboard to PTY
+                                    ssize_t bytes_written = write(pty_master_fd, clipboard_text, strlen(clipboard_text));
+                                    if (bytes_written < 0) {
+                                        perror("Failed to paste to PTY");
+                                    } else {
+                                        printf("Pasted %zd bytes to PTY\n", bytes_written);
+                                    }
+                                } else {
+                                    // In non-interactive mode, insert at cursor
+                                    size_t clipboard_len = strlen(clipboard_text);
+                                    size_t current_len = strlen(terminal.input_buffer);
+
+                                    if (current_len + clipboard_len < MAX_LINE_LENGTH) {
+                                        // Make room for pasted text
+                                        memmove(terminal.input_buffer + terminal.cursor_pos + clipboard_len,
+                                                terminal.input_buffer + terminal.cursor_pos,
+                                                current_len - terminal.cursor_pos + 1);
+
+                                        // Insert clipboard text
+                                        memcpy(terminal.input_buffer + terminal.cursor_pos,
+                                               clipboard_text, clipboard_len);
+
+                                        terminal.cursor_pos += clipboard_len;
+                                        printf("Pasted text to input buffer\n");
+                                    } else {
+                                        printf("Clipboard text too long to paste\n");
+                                    }
+                                }
+                            } else {
+                                printf("Clipboard is empty\n");
+                            }
+                        }
                         break;
                     case 2:  // Clear Screen
                         if (interactive_mode) {
@@ -1460,7 +1496,15 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                         resize_pty_to_window();
                         rewrap_terminal_content();
                         break;
-                    case 5:  // Exit
+                    case 5:  // Split Vertical
+                        printf("Split Vertical selected\n");
+                        // TODO: Implement vertical split functionality
+                        break;
+                    case 6:  // Split Horizontal
+                        printf("Split Horizontal selected\n");
+                        // TODO: Implement horizontal split functionality
+                        break;
+                    case 7:  // Exit
                         glfwSetWindowShouldClose(window, GLFW_TRUE);
                         break;
                 }
@@ -1541,7 +1585,7 @@ void render_context_menu() {
                        menu_items[i],
                        context_menu.x + 10,
                        item_y + context_menu.text_y_offset,
-                       0.8f,
+                       1.0f,
                        1.0f);
         }
     }
