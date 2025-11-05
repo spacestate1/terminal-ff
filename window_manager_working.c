@@ -964,15 +964,32 @@ void wm_handle_mouse(WindowManager* wm, double x, double y, int button, int acti
 
 void wm_cleanup(WindowManager* wm) {
     if (!wm) return;
-    
+
+    // Track freed fonts to avoid double-free when multiple windows share the same font
+    FontInfo* freed_fonts[MAX_WINDOWS] = {NULL};
+    int freed_count = 0;
+
     // Clean up any allocated resources
     for (int i = 0; i < wm->window_count; i++) {
         Window* window = &wm->windows[i];
         if (window->font) {
-            FreeFont(window->font);
+            // Check if this font has already been freed
+            bool already_freed = false;
+            for (int j = 0; j < freed_count; j++) {
+                if (freed_fonts[j] == window->font) {
+                    already_freed = true;
+                    break;
+                }
+            }
+
+            // Only free if not already freed
+            if (!already_freed) {
+                FreeFont(window->font);
+                freed_fonts[freed_count++] = window->font;
+            }
             window->font = NULL;
         }
     }
-    
+
     printf("✓ Window manager cleanup complete\n");
 }
