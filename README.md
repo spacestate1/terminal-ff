@@ -3,7 +3,7 @@
 A terminal emulator written in C. It draws the text itself with OpenGL, runs a
 real shell, and opens straight into bash.
 
-![Colours and text attributes](docs/screenshots/01-colors.png)
+![Two shells side by side](docs/screenshots/03-split-side-by-side.png)
 
 ## What it does
 
@@ -65,11 +65,11 @@ Editing its own source code:
 
 ![vim editing terminal.c](docs/screenshots/02-source.png)
 
-Two shells side by side:
+Colours, bold, underline and reverse video:
 
-![side by side split](docs/screenshots/03-split-side-by-side.png)
+![colours](docs/screenshots/01-colors.png)
 
-The same split, stacked instead:
+The same window split top and bottom instead:
 
 ![stacked split](docs/screenshots/04-split-stacked.png)
 
