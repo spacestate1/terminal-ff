@@ -1,0 +1,12 @@
+# Build artifacts
+*.o
+/terminal
+
+# Editor and session leftovers
+*.swp
+.*.swp
+nano.*.save
+terminal_output.log
+
+# Local tooling config
+.claude/
