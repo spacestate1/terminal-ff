@@ -75,11 +75,20 @@ install_dependencies() {
 
         pacman)
             print_info "Installing build tools and libraries..."
+            # Prefer the unified "glfw" package, which carries both the X11 and
+            # Wayland backends. Older repos only have the split glfw-x11, so
+            # fall back to that rather than failing the whole install.
+            local glfw_pkg="glfw"
+            if ! pacman -Si glfw &> /dev/null; then
+                glfw_pkg="glfw-x11"
+                print_warning "Unified 'glfw' unavailable, using X11-only glfw-x11"
+            fi
+
             sudo pacman -Sy --needed --noconfirm \
                 base-devel \
                 gcc \
                 make \
-                glfw-x11 \
+                "$glfw_pkg" \
                 glew \
                 mesa \
                 glu \
@@ -181,6 +190,40 @@ compile_terminal() {
     fi
 }
 
+# Confirm the binary can actually start here. Compiling proves the -dev
+# headers were present; it does not prove the runtime .so files resolve, and
+# a missing one fails in the loader before main() ever runs.
+verify_build() {
+    print_info "Verifying the binary's libraries resolve..."
+
+    if ! command -v ldd &> /dev/null; then
+        print_warning "ldd not available, skipping link check"
+        return 0
+    fi
+
+    local missing
+    missing=$(ldd ./terminal 2>/dev/null | grep "not found" || true)
+
+    if [ -n "$missing" ]; then
+        print_error "The binary is missing shared libraries at runtime:"
+        echo "$missing"
+        return 1
+    fi
+
+    print_success "All shared libraries resolve"
+
+    # Assets are loaded relative to the binary, so flag a broken layout here
+    # rather than at first launch.
+    if [ ! -f "assets/fonts/font_basis33.json" ] || [ ! -f "assets/ui/9-slice-basice9.png" ]; then
+        print_error "assets/ is incomplete - the terminal will not start"
+        print_info "Keep the assets/ folder next to the terminal binary"
+        return 1
+    fi
+    print_success "Assets present"
+
+    return 0
+}
+
 # Main installation process
 main() {
     echo ""
@@ -215,12 +258,23 @@ main() {
 
     # Compile
     if compile_terminal; then
+        if ! verify_build; then
+            print_error "Build produced a binary that cannot run here"
+            exit 1
+        fi
+
         echo ""
         print_success "Installation complete!"
         echo ""
         print_info "Installation summary:"
-        echo "  - Binary: ./terminal"
-        echo "  - Run with: ./terminal"
+        echo "  - Binary: $(pwd)/terminal"
+        echo "  - Run with: ./terminal (or from anywhere by full path)"
+        echo ""
+        print_info "The binary finds assets/ next to itself, so it runs from"
+        print_info "any directory. To install it system-wide, move the whole"
+        print_info "folder and symlink the binary, e.g.:"
+        echo "    sudo cp -r \"$(pwd)\" /opt/terminal-ff"
+        echo "    sudo ln -sf /opt/terminal-ff/terminal /usr/local/bin/terminal"
         echo ""
 
     else

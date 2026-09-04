@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <libgen.h>
+#include <limits.h>
 #include <pty.h>
 #include <termios.h>
 #include <fcntl.h>
@@ -27,6 +28,95 @@
 
 // Played on Enter. Relative to the exe directory, like the font and UI assets.
 #define ENTER_SOUND_PATH "assets/sounds/enter_sound.mp3"
+
+// =============================================================================
+// Asset paths
+// =============================================================================
+//
+// Assets are found relative to the executable, never the working directory.
+// Two things break a cwd-relative path: launching from anywhere but the
+// project folder (a .desktop file, a menu entry, a copy in /usr/local/bin),
+// and the built-in `cd`, which calls chdir() and so would strand any texture
+// reloaded later on - the 9-slice is re-read every time a split opens.
+//
+// asset_path() returns a pointer to one of a small ring of static buffers, so
+// a caller can pass two of them to the same function (LoadFont takes a JSON
+// path and a texture path) without the second overwriting the first.
+
+#define ASSET_RING 4
+
+static char asset_root[PATH_MAX];   // exe directory, with trailing '/'; empty until resolved
+
+// Resolve the directory holding the running executable. Falls back to a
+// cwd-relative path if /proc is unavailable, which keeps the old behaviour
+// rather than failing outright.
+// Does this directory actually hold our assets? Used to reject a candidate
+// root before committing to it.
+static bool asset_root_is_valid(const char* dir) {
+    if (!dir || !dir[0]) return false;
+
+    char probe[PATH_MAX];
+    int written = snprintf(probe, sizeof(probe), "%s/assets/fonts/font_basis33.json", dir);
+    if (written < 0 || written >= (int)sizeof(probe)) return false;
+
+    return access(probe, R_OK) == 0;
+}
+
+static void asset_root_init(const char* argv0) {
+    // Candidate roots, best first. /proc/self/exe is normally authoritative,
+    // but it names the *loader* when the binary is started through an explicit
+    // `ld-linux ... ./terminal` invocation, so each candidate is checked for
+    // the assets rather than trusted outright.
+    char candidates[2][PATH_MAX];
+    int count = 0;
+
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        char* dir = dirname(exe);   // may modify its argument
+        if (dir) snprintf(candidates[count++], PATH_MAX, "%s", dir);
+    }
+
+    // argv[0] covers the no-/proc case and the loader case above.
+    if (argv0 && strchr(argv0, '/')) {
+        char arg_copy[PATH_MAX];
+        snprintf(arg_copy, sizeof(arg_copy), "%s", argv0);
+        char* dir = dirname(arg_copy);
+        if (dir) snprintf(candidates[count++], PATH_MAX, "%s", dir);
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (!asset_root_is_valid(candidates[i])) continue;
+        int written = snprintf(asset_root, sizeof(asset_root), "%s/", candidates[i]);
+        if (written > 0 && written < (int)sizeof(asset_root)) return;
+    }
+
+    // Nothing verified. Fall back to the first candidate anyway so the error
+    // message names a plausible directory, or to cwd-relative if there is
+    // none - the font load then fails with a path the user can act on.
+    if (count > 0) {
+        int written = snprintf(asset_root, sizeof(asset_root), "%s/", candidates[0]);
+        if (written > 0 && written < (int)sizeof(asset_root)) return;
+    }
+    asset_root[0] = '\0';
+}
+
+// Absolute path for an asset given relative to the project root.
+static const char* asset_path(const char* relative) {
+    static char buffers[ASSET_RING][PATH_MAX];
+    static int next = 0;
+
+    char* out = buffers[next];
+    next = (next + 1) % ASSET_RING;
+
+    if (asset_root[0] == '\0') {
+        snprintf(out, PATH_MAX, "%s", relative);
+    } else {
+        snprintf(out, PATH_MAX, "%s%s", asset_root, relative);
+    }
+    return out;
+}
 
 // LOW LATENCY: Disable verbose debug output for production builds
 // Compile with -DDEBUG_VERBOSE to enable detailed logging
@@ -377,17 +467,42 @@ static int terminal_cols_for_window(Window* win) {
 // default environment; if it is not installed we fall over to sh so the
 // terminal still comes up on a minimal system. Only returns if both fail.
 static void exec_default_shell(void) {
-    // Ensure bash loads with full completion support.
-    setenv("BASH_COMPLETION_USER_FILE", "/etc/bash_completion", 1);
+    // Honour the user's chosen shell before assuming bash. $SHELL is what
+    // chsh sets, so a zsh or fish user gets their own shell here rather than
+    // being silently dropped into bash.
+    const char* user_shell = getenv("SHELL");
 
-    // -i so bash reads .bashrc and runs its line editor.
-    execlp("bash", "bash", "-i", (char*)NULL);
+    // -l as well as -i. An interactive non-login bash reads only ~/.bashrc,
+    // so anything exported from ~/.bash_profile or ~/.profile - commonly PATH
+    // entries for version managers like tfenv, nvm, pyenv, and ~/.local/bin -
+    // was missing, and those tools appeared not to be installed. A login
+    // shell reads the profile files, which is what every other terminal
+    // emulator gives you.
+    //
+    // BASH_COMPLETION_USER_FILE is deliberately not set: it names the *user*
+    // completion file (default ~/.bash_completion), so pointing it at the
+    // system loader both misused the variable and suppressed the user's own.
+    // The system completions load from /etc/bash.bashrc on their own.
+    if (user_shell && user_shell[0] == '/') {
+        // argv[0] with a leading '-' is the convention that marks a login
+        // shell, and it is what zsh and fish read; bash also accepts -l.
+        const char* base = strrchr(user_shell, '/');
+        base = base ? base + 1 : user_shell;
+
+        char argv0[64];
+        snprintf(argv0, sizeof(argv0), "-%s", base);
+
+        execl(user_shell, argv0, "-i", (char*)NULL);
+        // Falls through to bash if $SHELL is set but unusable.
+    }
+
+    execlp("bash", "-bash", "-l", "-i", (char*)NULL);
 
     // stderr is the PTY slave here, so this lands in the terminal window and
     // explains why the prompt that follows is sh rather than bash.
     fprintf(stderr, "bash unavailable (%s), falling back to sh\r\n", strerror(errno));
 
-    execlp("sh", "sh", "-i", (char*)NULL);
+    execlp("sh", "-sh", "-i", (char*)NULL);
     fprintf(stderr, "sh unavailable (%s): no shell to run\r\n", strerror(errno));
 }
 
@@ -524,8 +639,14 @@ void start_interactive_shell(const char* cmd) {
         // Suppress terminal capability warnings during bash startup
         setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
 
-        // Ensure readline uses proper completion settings
-        setenv("INPUTRC", "/etc/inputrc", 0);  // Use system default if not set
+        // Readline finds /etc/inputrc and ~/.inputrc on its own. Only point
+        // INPUTRC at the system file if it actually exists: Arch and minimal
+        // Fedora images ship without one, and naming a missing file makes
+        // readline skip the user's ~/.inputrc as well, silently dropping
+        // their key bindings.
+        if (access("/etc/inputrc", R_OK) == 0) {
+            setenv("INPUTRC", "/etc/inputrc", 0);
+        }
 
         // Configure terminal attributes for proper interactive shell operation
         struct termios tios;
@@ -3432,7 +3553,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window_right->anchor = ANCHOR_CENTER_RIGHT;
                             term_window_right->position = SCREEN_COORD(-WINDOW_EDGE_PADDING, 0);
                             term_window_right->size = WINDOW_SIZE(half_width, usable_height);
-                            term_window_right->texture_path = font_path_from_string("assets/ui/9-slice-basice9.png");
+                            term_window_right->texture_path = font_path_from_string(asset_path("assets/ui/9-slice-basice9.png"));
                             term_window_right->text_color = TEXT_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
                             term_window_right->font_size = FONT_SIZE(1.0f);
                             // FIXED: Copy border size from left terminal instead of hardcoding
@@ -3447,8 +3568,8 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             // window is set up, or reusing the window leaks one font
                             // per split.
                             if (!term_window_right->font) {
-                                term_window_right->font = LoadFont("assets/fonts/font_basis33.json",
-                                                                "assets/fonts/font_basis33.png");
+                                term_window_right->font = LoadFont(asset_path("assets/fonts/font_basis33.json"),
+                                                    asset_path("assets/fonts/font_basis33.png"));
                                 if (!term_window_right->font) {
                                     fprintf(stderr, "Failed to load font for right terminal\n");
                                 }
@@ -3686,7 +3807,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window_bottom->anchor = ANCHOR_BOTTOM_CENTER;
                             term_window_bottom->position = SCREEN_COORD(0, -WINDOW_EDGE_PADDING);
                             term_window_bottom->size = WINDOW_SIZE(usable_width, half_height);
-                            term_window_bottom->texture_path = font_path_from_string("assets/ui/9-slice-basice9.png");
+                            term_window_bottom->texture_path = font_path_from_string(asset_path("assets/ui/9-slice-basice9.png"));
                             term_window_bottom->text_color = TEXT_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
                             term_window_bottom->font_size = FONT_SIZE(1.0f);
                             // FIXED: Copy border size from top terminal instead of hardcoding
@@ -3701,8 +3822,8 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             // window is set up, or reusing the window leaks one font
                             // per split.
                             if (!term_window_bottom->font) {
-                                term_window_bottom->font = LoadFont("assets/fonts/font_basis33.json",
-                                                                    "assets/fonts/font_basis33.png");
+                                term_window_bottom->font = LoadFont(asset_path("assets/fonts/font_basis33.json"),
+                                                    asset_path("assets/fonts/font_basis33.png"));
                                 if (!term_window_bottom->font) {
                                     fprintf(stderr, "Failed to load font for bottom terminal\n");
                                 }
@@ -4155,22 +4276,41 @@ static void glfw_error_callback(int error, const char* description) {
 
 int main(int argc, char** argv) {
     (void)argc;
-    (void)argv;
 
-    // Check DISPLAY environment variable
+    // Locate the assets before anything tries to load one. This must happen
+    // first: it is what lets the binary run from outside the project folder.
+    asset_root_init(argv[0]);
+
+    // A session needs either X11 or Wayland. Checking DISPLAY alone turned a
+    // pure-Wayland desktop - now the default on Fedora and Ubuntu - into a
+    // hard exit before GLFW ever got a chance to try its Wayland backend.
     const char* display = getenv("DISPLAY");
-    if (!display || display[0] == '\0') {
-        fprintf(stderr, "Error: DISPLAY environment variable not set.\n");
+    const char* wayland = getenv("WAYLAND_DISPLAY");
+    bool have_x11     = display && display[0] != '\0';
+    bool have_wayland = wayland && wayland[0] != '\0';
+
+    if (!have_x11 && !have_wayland) {
+        fprintf(stderr, "Error: no display server found "
+                        "(neither DISPLAY nor WAYLAND_DISPLAY is set).\n");
         fprintf(stderr, "If running over SSH, use: ssh -X user@host\n");
-        fprintf(stderr, "If running locally, ensure X11/Wayland is running.\n");
+        fprintf(stderr, "If running locally, ensure X11 or Wayland is running.\n");
         return -1;
     }
-    printf("Using DISPLAY=%s\n", display);
+    printf("Using %s=%s\n", have_x11 ? "DISPLAY" : "WAYLAND_DISPLAY",
+                            have_x11 ? display : wayland);
 
     // Initialize GLFW with error callback for debugging
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
+        // Most distributions ship an X11-only GLFW (Arch's glfw-x11, and the
+        // Debian/Ubuntu libglfw3 built without the Wayland backend). On a
+        // Wayland session that build needs XWayland, so say so rather than
+        // leaving the bare GLFW error as the only clue.
+        if (!have_x11 && have_wayland) {
+            fprintf(stderr, "This looks like a Wayland session with no XWayland.\n");
+            fprintf(stderr, "Install XWayland, or a GLFW built with Wayland support.\n");
+        }
         return -1;
     }
 
@@ -4241,7 +4381,7 @@ int main(int argc, char** argv) {
     term_window->anchor = ANCHOR_CENTER;
     term_window->position = SCREEN_COORD(0, 0);
     term_window->size = WINDOW_SIZE(WINDOW_WIDTH - 40, WINDOW_HEIGHT - 40);
-    term_window->texture_path = font_path_from_string("assets/ui/9-slice-basice9.png");
+    term_window->texture_path = font_path_from_string(asset_path("assets/ui/9-slice-basice9.png"));
     term_window->text_color = TEXT_COLOR(1.0f, 1.0f, 1.0f, 1.0f); // White text
     term_window->font_size = FONT_SIZE(1.0f);  // 16px - default size
     term_window->border_size = BORDER_SIZE(8);
@@ -4250,11 +4390,15 @@ int main(int argc, char** argv) {
     term_window->center_alpha = 0.9f; // Slightly transparent center
 
     // Load font_basis33
-    printf("Loading font from: assets/fonts/font_basis33.json\n");
-    printf("Loading texture from: assets/fonts/font_basis33.png\n");
-    term_window->font = LoadFont("assets/fonts/font_basis33.json", "assets/fonts/font_basis33.png");
+    printf("Loading assets from: %s\n", asset_root[0] ? asset_root : "(current directory)");
+    term_window->font = LoadFont(asset_path("assets/fonts/font_basis33.json"),
+                                 asset_path("assets/fonts/font_basis33.png"));
     if (!term_window->font) {
-        fprintf(stderr, "Failed to load font_basis33!\n");
+        // Name the directory actually searched - the usual cause is a binary
+        // moved away from its assets, and that is invisible otherwise.
+        fprintf(stderr, "Failed to load the font from %s\n",
+                asset_path("assets/fonts/"));
+        fprintf(stderr, "The assets/ folder must sit next to the terminal binary.\n");
         return -1;
     }
     printf("Font loaded successfully!\n");
@@ -4271,7 +4415,7 @@ int main(int argc, char** argv) {
     apply_window_size_limits(window);
 
     // Optional: the terminal runs fine with no audio device.
-    if (!sound_init(ENTER_SOUND_PATH)) {
+    if (!sound_init(asset_path(ENTER_SOUND_PATH))) {
         printf("Sound disabled (no clip or no audio device)\n");
     }
 
