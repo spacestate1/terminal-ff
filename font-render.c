@@ -24,6 +24,14 @@ FontInfo* LoadFontInfo(const char* filename) {
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
 
+    // ftell returns -1 on anything it cannot seek, such as a fifo. That went
+    // on to allocate one byte and then read (size_t)-1 into it.
+    if (file_size <= 0) {
+        fprintf(stderr, "Font info file is empty or not seekable: %s\n", filename);
+        fclose(file);
+        return NULL;
+    }
+
     char *json_text = malloc(file_size + 1);
     if (!json_text) {
         printf("Failed to allocate memory for JSON text\n");

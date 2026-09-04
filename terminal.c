@@ -139,6 +139,14 @@ static const char* asset_path(const char* relative) {
 #define MAX_TERMINAL_LINES 1000
 #define MAX_LINE_LENGTH 256
 
+// Rows are copied out of the ANSI buffer into MAX_LINE_LENGTH stack buffers and
+// NUL-terminated at the column count. That only holds while a full-width row
+// plus its terminator fits, and the two constants live in different headers -
+// so state the dependency here instead of leaving raising ANSI_BUFFER_COLS as a
+// silent stack overflow waiting for whoever lifts the 120-column limit.
+_Static_assert(ANSI_BUFFER_COLS < MAX_LINE_LENGTH,
+               "ANSI_BUFFER_COLS must leave room for a NUL in a MAX_LINE_LENGTH buffer");
+
 // Terminal state
 typedef struct {
     char lines[MAX_TERMINAL_LINES][MAX_LINE_LENGTH];  // Display lines (after wrapping)
@@ -414,7 +422,7 @@ void terminal_update_prompt() {
     char username[64] = "user";
     char hostname[64] = "localhost";
     char cwd[256] = "~";
-    char short_cwd[64];
+    char short_cwd[64] = "~";   // never read uninitialised, whatever follows fails
 
     // Get username
     const char* user = getenv("USER");
@@ -435,10 +443,11 @@ void terminal_update_prompt() {
             strncpy(short_cwd, base, sizeof(short_cwd) - 1);
             short_cwd[sizeof(short_cwd) - 1] = '\0';
         } else {
+            // strncpy only NUL-terminates when the source is short enough, and
+            // a working directory longer than this buffer is entirely ordinary.
             strncpy(short_cwd, cwd, sizeof(short_cwd) - 1);
+            short_cwd[sizeof(short_cwd) - 1] = '\0';
         }
-    } else {
-        strncpy(short_cwd, "~", sizeof(short_cwd) - 1);
     }
 
     // Format prompt: [user@hostname dir]$
@@ -469,6 +478,13 @@ static int terminal_cols_for_window(Window* win) {
     if (cols > 6) cols -= 6;
     if (cols < 20) cols = 20;
     if (cols > ANSI_BUFFER_COLS) cols = ANSI_BUFFER_COLS;
+
+    // The renderers copy a row into a MAX_LINE_LENGTH buffer and terminate it
+    // at this column, so the count has to leave room for that NUL. Clamping
+    // here rather than at each of those five call sites keeps every consumer -
+    // the renderers, the wrap width, and the size handed to the child via
+    // TIOCSWINSZ - safe from one place.
+    if (cols > MAX_LINE_LENGTH - 1) cols = MAX_LINE_LENGTH - 1;
     return cols;
 }
 
@@ -1196,6 +1212,11 @@ void terminal_init() {
 
 // Strip ANSI escape codes from text
 void strip_ansi_codes(char* dest, const char* src, size_t max_len) {
+    // max_len is unsigned, so a zero here would make the "j < max_len - 1"
+    // below compare against SIZE_MAX and write until something gave way.
+    if (!dest || max_len == 0) return;
+    if (!src) { dest[0] = '\0'; return; }
+
     size_t j = 0;
     bool in_escape = false;
 

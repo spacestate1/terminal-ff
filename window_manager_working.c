@@ -64,8 +64,11 @@ float wm_measure_text_width(FontInfo* font, const char* text, FontSize font_size
             continue;
         }
 
+        // last_char is inclusive, so the range check needs the + 1 that
+        // calculate_word_width() has: without it the font's final glyph was
+        // measured with the fallback width instead of its own.
         int char_index = *text - font->first_char;
-        if (char_index >= 0 && char_index < font->last_char - font->first_char) {
+        if (char_index >= 0 && char_index <= font->last_char - font->first_char) {
             // Get advance_x from metrics (index 6 in the 7-value metric array)
             total_width += font_size.value * font->metrics[char_index * 7 + 6];
         } else {
@@ -434,10 +437,12 @@ int wm_load_config(WindowManager* wm, const char* filename) {
                     strncpy(json_path, v, sizeof(json_path) - 1);
                     json_path[sizeof(json_path) - 1] = '\0';
                     
-                    // Replace .png with .json
+                    // Replace .png with .json. ".json" is a byte longer than
+                    // ".png", so a path that fills json_path right to the end
+                    // would have had the copy write one past it.
                     char* ext = strstr(json_path, ".png");
-                    if (ext) {
-                        strcpy(ext, ".json");
+                    if (ext && (size_t)(ext - json_path) + sizeof(".json") <= sizeof(json_path)) {
+                        memcpy(ext, ".json", sizeof(".json"));
                     }
                     
                     current_window->font = LoadFont(json_path, v);
