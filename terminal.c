@@ -177,14 +177,21 @@ char last_tab_completion[MAX_LINE_LENGTH] = "";
 // Holds "<dir>/<match>", so it needs room for two MAX_LINE_LENGTH components.
 char last_completed_path[MAX_LINE_LENGTH * 2] = "";
 
-// Split terminal state
-bool split_horizontal = false;  // Left/right split
-bool split_vertical = false;     // Top/bottom split
+// Split terminal state.
+//
+// Named for the arrangement rather than the divider. The previous names said
+// the opposite of what they did - the flag for the left/right split was called
+// split_horizontal - so every site that tested one read backwards. The menu
+// labels follow the other convention and name the divider, which is why
+// "Split Vertical" draws a vertical line and so produces the side-by-side
+// pair, the same way it does in tmux and iTerm.
+bool split_side_by_side = false;  // Two panes, left and right
+bool split_stacked = false;       // Two panes, top and bottom
 int focused_terminal = 0;  // 0 = left/top, 1 = right/bottom
-Window* term_window_right = NULL;   // Right terminal (horizontal split)
-Window* term_window_bottom = NULL;  // Bottom terminal (vertical split)
+Window* term_window_right = NULL;   // Right pane of a side-by-side split
+Window* term_window_bottom = NULL;  // Bottom pane of a stacked split
 
-// Right terminal state (for independent split terminal - horizontal split)
+// Right pane state (an independent shell, side by side with the main one)
 TerminalState terminal_right = {0};
 AnsiTerminal ansi_term_right;
 int pty_master_fd_right = -1;
@@ -193,7 +200,7 @@ bool interactive_mode_right = false;
 double pty_start_time_right = 0.0;
 int ansi_scroll_offset_right = 0;  // Manual scroll offset for right ANSI buffer
 
-// Bottom terminal state (for independent split terminal - vertical split)
+// Bottom pane state (an independent shell, stacked under the main one)
 TerminalState terminal_bottom = {0};
 AnsiTerminal ansi_term_bottom;
 int pty_master_fd_bottom = -1;
@@ -259,6 +266,7 @@ void char_callback(GLFWwindow* window, unsigned int codepoint);
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods);
 void cursor_position_callback(GLFWwindow* window, double xpos, double ypos);
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
+static void shutdown_pty(pid_t* pid, int* master_fd);
 
 // Convert Unicode codepoint to UTF-8 bytes
 // Returns number of bytes written (1-4), or 0 if codepoint is invalid
@@ -507,6 +515,57 @@ static void exec_default_shell(void) {
     fprintf(stderr, "sh unavailable (%s): no shell to run\r\n", strerror(errno));
 }
 
+// Child-side setup, run between forkpty() and exec. Every pane goes through
+// this. The split panes used to carry their own copy of it, and the two had
+// drifted: they announced TERM=xterm instead of xterm-256color, so colour-aware
+// programs ran in a smaller palette there, and they left canonical mode on
+// where the main pane turns it off. A shell in a split behaved differently
+// from the identical shell beside it.
+static void configure_pty_child(void) {
+    // forkpty already created a new session and controlling terminal.
+    // DO NOT call setsid() - it would detach from the controlling terminal.
+
+    // The PTY slave is already stdin/stdout/stderr thanks to forkpty; close
+    // anything else this process inherited.
+    for (int fd = 3; fd < 256; fd++) {
+        close(fd);
+    }
+
+    // xterm-256color for full colour support.
+    setenv("TERM", "xterm-256color", 1);
+
+    // Suppress terminal capability warnings during bash startup.
+    setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
+
+    // Readline finds /etc/inputrc and ~/.inputrc on its own. Only point
+    // INPUTRC at the system file if it actually exists: Arch and minimal
+    // Fedora images ship without one, and naming a missing file makes
+    // readline skip the user's ~/.inputrc as well, silently dropping
+    // their key bindings.
+    if (access("/etc/inputrc", R_OK) == 0) {
+        setenv("INPUTRC", "/etc/inputrc", 0);
+    }
+
+    // Configure terminal attributes for proper interactive shell operation
+    struct termios tios;
+    if (tcgetattr(STDIN_FILENO, &tios) == 0) {
+        // Disable canonical mode so bash can use its own line editing (readline)
+        tios.c_lflag &= ~ICANON;
+        // Enable echo, backspace erase, and signal generation
+        tios.c_lflag |= ECHO | ECHOE | ECHOK | ISIG;
+        // Enable output processing (OPOST) and newline conversion (ONLCR)
+        tios.c_oflag |= OPOST | ONLCR;
+        // Set input flags: CR to NL conversion, enable flow control
+        tios.c_iflag |= ICRNL | IXON;
+        // Set erase character to backspace/DEL (0x7f)
+        tios.c_cc[VERASE] = 0x7f;
+        // Set minimum chars and timeout for non-canonical mode
+        tios.c_cc[VMIN] = 1;
+        tios.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &tios);
+    }
+}
+
 // A pane narrower or shorter than this is not a terminal any more, it is a
 // sliver. These are the floors the window minimum is built from.
 #define MIN_PANE_COLS 24
@@ -562,9 +621,9 @@ static void apply_window_size_limits(GLFWwindow* window) {
     int min_w = (int)pane_w + WINDOW_EDGE_PADDING * 2;
     int min_h = (int)pane_h + WINDOW_EDGE_PADDING * 2;
 
-    if (split_horizontal) {
+    if (split_side_by_side) {
         min_w = (int)(pane_w * 2) + TERMINAL_GAP + WINDOW_EDGE_PADDING * 2;
-    } else if (split_vertical) {
+    } else if (split_stacked) {
         min_h = (int)(pane_h * 2) + TERMINAL_GAP + WINDOW_EDGE_PADDING * 2;
     }
 
@@ -624,49 +683,7 @@ void start_interactive_shell(const char* cmd) {
 
     if (pty_child_pid == 0) {
         // Child: becomes the shell / program
-
-        // forkpty already created a new session and controlling terminal
-        // DO NOT call setsid() - it would detach from the controlling terminal
-
-        // The PTY slave is already stdin/stdout/stderr thanks to forkpty
-        // Close any other inherited file descriptors
-        for (int fd = 3; fd < 256; fd++) {
-            close(fd);
-        }
-
-        // Set terminal type - use xterm-256color for full feature support
-        setenv("TERM", "xterm-256color", 1);
-
-        // Suppress terminal capability warnings during bash startup
-        setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
-
-        // Readline finds /etc/inputrc and ~/.inputrc on its own. Only point
-        // INPUTRC at the system file if it actually exists: Arch and minimal
-        // Fedora images ship without one, and naming a missing file makes
-        // readline skip the user's ~/.inputrc as well, silently dropping
-        // their key bindings.
-        if (access("/etc/inputrc", R_OK) == 0) {
-            setenv("INPUTRC", "/etc/inputrc", 0);
-        }
-
-        // Configure terminal attributes for proper interactive shell operation
-        struct termios tios;
-        if (tcgetattr(STDIN_FILENO, &tios) == 0) {
-            // Disable canonical mode so bash can use its own line editing (readline)
-            tios.c_lflag &= ~ICANON;
-            // Enable echo, backspace erase, and signal generation
-            tios.c_lflag |= ECHO | ECHOE | ECHOK | ISIG;
-            // Enable output processing (OPOST) and newline conversion (ONLCR)
-            tios.c_oflag |= OPOST | ONLCR;
-            // Set input flags: CR to NL conversion, enable flow control
-            tios.c_iflag |= ICRNL | IXON;
-            // Set erase character to backspace/DEL (0x7f)
-            tios.c_cc[VERASE] = 0x7f;
-            // Set minimum chars and timeout for non-canonical mode
-            tios.c_cc[VMIN] = 1;
-            tios.c_cc[VTIME] = 0;
-            tcsetattr(STDIN_FILENO, TCSANOW, &tios);
-        }
+        configure_pty_child();
 
         if (cmd && *cmd) {
             execlp("sh", "sh", "-c", cmd, (char*)NULL);
@@ -693,6 +710,62 @@ void start_interactive_shell(const char* cmd) {
     resize_pty_to_window();
 }
 
+// Bash and curses programs sometimes complain on stderr while the PTY is
+// still settling. Match a single line, not the whole read: this used to run
+// strstr over the entire 4KB chunk and drop all of it on a hit, throwing away
+// the real output either side of the warning - escape sequences included, so
+// colours and cursor moves vanished along with it.
+static bool is_startup_noise(const char* line, int len) {
+    static const char* const patterns[] = {
+        "Cannot get terminal settings",
+        "SLang_getkey",
+        "Assuming EOF on stdin",
+        "Failed to open terminal",
+    };
+
+    if (len <= 0) return false;
+
+    char tmp[256];
+    if (len > (int)sizeof(tmp) - 1) len = (int)sizeof(tmp) - 1;
+    memcpy(tmp, line, (size_t)len);
+    tmp[len] = '\0';
+
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        if (strstr(tmp, patterns[i]) != NULL) return true;
+    }
+    return false;
+}
+
+// Hand a PTY read to the parser, dropping startup warning lines for the first
+// couple of seconds. The segments go over in order and the parser already
+// stitches escape sequences across calls, so splitting the chunk on newlines
+// costs nothing.
+static void feed_pty_output(AnsiTerminal* term, const char* buf, int len,
+                            double start_time) {
+    if (len <= 0) return;
+
+    if (glfwGetTime() - start_time >= 2.0) {
+        ansi_process_output(term, buf, len);
+        return;
+    }
+
+    int i = 0;
+    while (i < len) {
+        int eol = i;
+        while (eol < len && buf[eol] != '\n') eol++;
+
+        // No newline yet means this is the tail of the read rather than a
+        // finished line, so pass it through instead of judging it half-read.
+        bool complete = (eol < len);
+        int end = complete ? eol + 1 : len;
+
+        if (!complete || !is_startup_noise(buf + i, eol - i)) {
+            ansi_process_output(term, buf + i, end - i);
+        }
+        i = end;
+    }
+}
+
 // Poll PTY for output
 void poll_pty() {
     if (pty_master_fd < 0) return;
@@ -711,25 +784,7 @@ void poll_pty() {
 
         ssize_t n = read(pty_master_fd, buf, sizeof(buf) - 1); // Leave room for null terminator
         if (n > 0) {
-            // Ensure buffer is safe for processing
-            buf[n] = '\0';
-
-            // Only filter startup error messages during the first 2 seconds
-            bool should_filter = false;
-            double elapsed = glfwGetTime() - pty_start_time;
-            if (elapsed < 2.0) {
-                // Filter out bash startup warning messages
-                if (strstr(buf, "Cannot get terminal settings") != NULL ||
-                    strstr(buf, "SLang_getkey") != NULL ||
-                    strstr(buf, "Assuming EOF on stdin") != NULL ||
-                    strstr(buf, "Failed to open terminal") != NULL) {
-                    should_filter = true;
-                }
-            }
-
-            if (!should_filter) {
-                ansi_process_output(&ansi_term, buf, (int)n);
-            }
+            feed_pty_output(&ansi_term, buf, (int)n, pty_start_time);
             // Continue reading to drain any remaining buffered data
         } else if (n == -1 && errno == EINTR) {
             // A signal landed mid-read. The shutdown handler deliberately does
@@ -793,23 +848,7 @@ void poll_pty_right() {
 
         ssize_t n = read(pty_master_fd_right, buf, sizeof(buf) - 1);
         if (n > 0) {
-            buf[n] = '\0';
-
-            // Filter startup messages for first 2 seconds
-            bool should_filter = false;
-            double elapsed = glfwGetTime() - pty_start_time_right;
-            if (elapsed < 2.0) {
-                if (strstr(buf, "Cannot get terminal settings") != NULL ||
-                    strstr(buf, "SLang_getkey") != NULL ||
-                    strstr(buf, "Assuming EOF on stdin") != NULL ||
-                    strstr(buf, "Failed to open terminal") != NULL) {
-                    should_filter = true;
-                }
-            }
-
-            if (!should_filter) {
-                ansi_process_output(&ansi_term_right, buf, (int)n);
-            }
+            feed_pty_output(&ansi_term_right, buf, (int)n, pty_start_time_right);
             // Continue reading to drain buffered data
         } else if (n == -1 && errno == EINTR) {
             // A signal landed mid-read. The shutdown handler deliberately does
@@ -866,20 +905,7 @@ void poll_pty_bottom() {
 
         ssize_t n = read(pty_master_fd_bottom, buf, sizeof(buf) - 1);
         if (n > 0) {
-            buf[n] = '\0';
-            bool should_filter = false;
-            double elapsed = glfwGetTime() - pty_start_time_bottom;
-            if (elapsed < 2.0) {
-                if (strstr(buf, "Cannot get terminal settings") != NULL ||
-                    strstr(buf, "SLang_getkey") != NULL ||
-                    strstr(buf, "Assuming EOF on stdin") != NULL ||
-                    strstr(buf, "Failed to open terminal") != NULL) {
-                    should_filter = true;
-                }
-            }
-            if (!should_filter) {
-                ansi_process_output(&ansi_term_bottom, buf, (int)n);
-            }
+            feed_pty_output(&ansi_term_bottom, buf, (int)n, pty_start_time_bottom);
             // Continue reading to drain buffered data
         } else if (n == -1 && errno == EINTR) {
             // A signal landed mid-read. The shutdown handler deliberately does
@@ -1306,6 +1332,39 @@ void rewrap_terminal_content() {
             terminal.line_count++;
         }
     }
+}
+
+// Put the main pane back to filling the window on its own. Closing a split and
+// unwinding one that could not be started both land here; this used to be four
+// copies of the same thirty lines, which is how it went unnoticed that the
+// error paths were skipping the 9-slice rebuild and leaving a half-width
+// border around a full-width pane.
+static void restore_single_pane_layout(GLFWwindow* window) {
+    if (!term_window) return;
+
+    int current_width = 0, current_height = 0;
+    glfwGetWindowSize(window, &current_width, &current_height);
+
+    term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
+    term_window->anchor = ANCHOR_CENTER;
+    term_window->position = SCREEN_COORD(0, 0);
+
+    // The 9-slice is built for one specific size, so it has to be rebuilt or
+    // the border keeps the shape of the pane that has just gone away.
+    NineSliceParams restore_params = {
+        .position = SCREEN_COORD(0, 0),
+        .size = term_window->size,
+        .borderLeft = term_window->border_size,
+        .borderRight = term_window->border_size,
+        .borderTop = term_window->border_size,
+        .borderBottom = term_window->border_size
+    };
+    createNineSlice(&term_window->nine_slice, &restore_params,
+                    WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+    invalidate_line_width_cache();
+    rewrap_terminal_content();
+    resize_pty_to_window();
 }
 
 // Add a line to terminal output
@@ -1927,7 +1986,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     }
     if (key == GLFW_KEY_F8) {
         // Increase font size in focused terminal
-        if (split_horizontal && focused_terminal == 1) {
+        if (split_side_by_side && focused_terminal == 1) {
             term_window_right->font_size.value += 0.1f;
             if (term_window_right->font_size.value > 5.0f) term_window_right->font_size.value = 5.0f;
             printf("Right terminal font size: %.1f (%.0fpx)\n", term_window_right->font_size.value, term_window_right->font_size.value * 16.0f);
@@ -1945,7 +2004,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     }
     if (key == GLFW_KEY_F9) {
         // Decrease font size in focused terminal
-        if (split_horizontal && focused_terminal == 1) {
+        if (split_side_by_side && focused_terminal == 1) {
             term_window_right->font_size.value -= 0.1f;
             if (term_window_right->font_size.value < 0.5f) term_window_right->font_size.value = 0.5f;
             printf("Right terminal font size: %.1f (%.0fpx)\n", term_window_right->font_size.value, term_window_right->font_size.value * 16.0f);
@@ -1992,7 +2051,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 
         if (control_char != 0) {
             // Route to appropriate terminal in split mode
-            if (split_horizontal) {
+            if (split_side_by_side) {
                 if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
                     write(pty_master_fd, &control_char, 1);
                     return;
@@ -2000,7 +2059,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
                     write(pty_master_fd_right, &control_char, 1);
                     return;
                 }
-            } else if (split_vertical) {
+            } else if (split_stacked) {
                 if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
                     write(pty_master_fd, &control_char, 1);
                     return;
@@ -2017,7 +2076,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 
     // Interactive mode - send all keys to PTY (including ESC for vim)
     // In split mode, route to focused terminal
-    if (split_horizontal) {
+    if (split_side_by_side) {
         if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
             send_key_to_pty(key);
             return;
@@ -2080,7 +2139,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
             }
             return;
         }
-    } else if (split_vertical) {
+    } else if (split_stacked) {
         if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
             send_key_to_pty(key);
             return;
@@ -2275,7 +2334,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 
     if (key == GLFW_KEY_PAGE_UP) {
         // In split mode, scroll the focused terminal
-        if (split_horizontal && focused_terminal == 1) {
+        if (split_side_by_side && focused_terminal == 1) {
             terminal_right.scroll_offset = (terminal_right.scroll_offset > 10) ? terminal_right.scroll_offset - 10 : 0;
         } else {
             terminal.scroll_offset = (terminal.scroll_offset > 10) ? terminal.scroll_offset - 10 : 0;
@@ -2285,7 +2344,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 
     if (key == GLFW_KEY_PAGE_DOWN) {
         // In split mode, scroll the focused terminal
-        if (split_horizontal && focused_terminal == 1) {
+        if (split_side_by_side && focused_terminal == 1) {
             // Calculate max visible lines for right terminal
             if (term_window_right && term_window_right->font) {
                 float line_height = term_window_right->font_size.value * 16.0f * (1.0f + term_window_right->line_spacing.value);
@@ -2321,7 +2380,7 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
     (void)window;
 
     // In split mode, route character input to focused terminal
-    if (split_horizontal) {
+    if (split_side_by_side) {
         char utf8[4];
         int len = codepoint_to_utf8(codepoint, utf8);
 
@@ -2351,7 +2410,7 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
             }
             return;
         }
-    } else if (split_vertical) {
+    } else if (split_stacked) {
         char utf8[4];
         int len = codepoint_to_utf8(codepoint, utf8);
 
@@ -2681,7 +2740,7 @@ void render_terminal_content() {
 
         // Render focus indicator in bottom left corner (after scissor test is disabled)
         // Show in split mode when left is focused, or in single terminal mode
-        if ((split_horizontal && focused_terminal == 0) || !split_horizontal) {
+        if ((split_side_by_side && focused_terminal == 0) || !split_side_by_side) {
             // Draw white box in bottom left corner of focused terminal
             float box_size = 20.0f;
             float box_x = pos.x + 20.0f;
@@ -3084,7 +3143,7 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
     Window* target_window = NULL;
 
     // Helper to check if point is inside window bounds
-    if (split_horizontal) {
+    if (split_side_by_side) {
         // Horizontal split: check right terminal first, then left
         if (term_window_right) {
             ScreenCoord pos = wm_calculate_position(&wm, term_window_right);
@@ -3102,7 +3161,7 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
                 target_window = term_window;
             }
         }
-    } else if (split_vertical) {
+    } else if (split_stacked) {
         // Vertical split: check bottom terminal first, then top
         if (term_window_bottom) {
             ScreenCoord pos = wm_calculate_position(&wm, term_window_bottom);
@@ -3137,10 +3196,10 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
         bool is_interactive = false;
         int* ansi_scroll_ptr = NULL;
 
-        if (split_horizontal && target_term == &terminal_right && interactive_mode_right) {
+        if (split_side_by_side && target_term == &terminal_right && interactive_mode_right) {
             is_interactive = true;
             ansi_scroll_ptr = &ansi_scroll_offset_right;
-        } else if (split_vertical && target_term == &terminal_bottom && interactive_mode_bottom) {
+        } else if (split_stacked && target_term == &terminal_bottom && interactive_mode_bottom) {
             is_interactive = true;
             ansi_scroll_ptr = &ansi_scroll_offset_bottom;
         } else if (target_term == &terminal && interactive_mode) {
@@ -3153,9 +3212,9 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
             int cursor_x, cursor_y;
             AnsiTerminal* ansi_term_ptr = NULL;
 
-            if (split_horizontal && target_term == &terminal_right) {
+            if (split_side_by_side && target_term == &terminal_right) {
                 ansi_term_ptr = &ansi_term_right;
-            } else if (split_vertical && target_term == &terminal_bottom) {
+            } else if (split_stacked && target_term == &terminal_bottom) {
                 ansi_term_ptr = &ansi_term_bottom;
             } else if (target_term == &terminal) {
                 ansi_term_ptr = &ansi_term;
@@ -3289,7 +3348,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
         // Check for focus switching in split mode
-        if (split_horizontal && term_window && term_window_right) {
+        if (split_side_by_side && term_window && term_window_right) {
             double mouse_x = context_menu.mouse_x;
             double mouse_y = context_menu.mouse_y;
 
@@ -3316,7 +3375,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                 printf("Focus switched to RIGHT terminal\n");
                 fflush(stdout);
             }
-        } else if (split_vertical && term_window && term_window_bottom) {
+        } else if (split_stacked && term_window && term_window_bottom) {
             double mouse_x = context_menu.mouse_x;
             double mouse_y = context_menu.mouse_y;
 
@@ -3428,22 +3487,16 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                         break;
                     case 5:  // Split Vertical
                         printf("Split Vertical selected\n");
-                        if (split_horizontal) {
-                            // Already split vertically (left/right) -> UNSPLIT
-                            printf("Unsplitting vertical split...\n");
+                        if (split_side_by_side) {
+                            // Already side by side -> close the split
+                            printf("Closing the side-by-side split...\n");
 
-                            // Close right terminal PTY
-                            if (pty_master_fd_right >= 0) {
-                                close(pty_master_fd_right);
-                                pty_master_fd_right = -1;
-                            }
-
-                            // Kill right terminal child process
-                            if (pty_child_pid_right > 0) {
-                                kill(pty_child_pid_right, SIGTERM);
-                                waitpid(pty_child_pid_right, NULL, WNOHANG);
-                                pty_child_pid_right = -1;
-                            }
+                            // Close the PTY and reap the child. A SIGTERM followed straight
+                            // away by a WNOHANG wait almost never catches the exit, so every
+                            // closed split used to leave a zombie behind for the rest of the
+                            // session. shutdown_pty() hangs up, waits, and only then gives up
+                            // and uses SIGKILL.
+                            shutdown_pty(&pty_child_pid_right, &pty_master_fd_right);
 
                             // Free right terminal font
                             if (term_window_right && term_window_right->font) {
@@ -3469,45 +3522,18 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             }
 
                             // Reset split flag and focus
-                            split_horizontal = false;
+                            split_side_by_side = false;
                             interactive_mode_right = false;
                             focused_terminal = 0;
 
-                            // Get current window size
-                            int current_width, current_height;
-                            glfwGetWindowSize(window, &current_width, &current_height);
+                            restore_single_pane_layout(window);
 
-                            // Restore main terminal to full size
-                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
-                            term_window->anchor = ANCHOR_CENTER;
-                            term_window->position = SCREEN_COORD(0, 0);
-
-                            // CRITICAL: Recreate 9-slice for restored full-size terminal
-                            NineSliceParams restore_params = {
-                                .position = SCREEN_COORD(0, 0),
-                                .size = term_window->size,
-                                .borderLeft = term_window->border_size,
-                                .borderRight = term_window->border_size,
-                                .borderTop = term_window->border_size,
-                                .borderBottom = term_window->border_size
-                            };
-                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
-
-                            // CRITICAL: Invalidate cache after size change
-                            invalidate_line_width_cache();
-
-                            // Rewrap main terminal content for new width
-                            rewrap_terminal_content();
-
-                            // Resize PTY
-                            resize_pty_to_window();
-
-                            printf("Vertical split disabled - returned to single terminal\n");
-                        } else if (split_vertical) {
-                            printf("Cannot split: terminal is already split horizontally\n");
+                            printf("Side-by-side split closed - back to a single terminal\n");
+                        } else if (split_stacked) {
+                            printf("Cannot split: the terminal is already stacked top and bottom\n");
                         } else {
-                            // Not split -> Split vertically (left/right)
-                            split_horizontal = true;
+                            // Not split -> put two panes side by side
+                            split_side_by_side = true;
                             focused_terminal = 0;
 
                             // Get current window size
@@ -3561,7 +3587,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             }
                             if (!term_window_right) {
                                 fprintf(stderr, "Cannot split: no window slots available\n");
-                                split_horizontal = false;
+                                split_side_by_side = false;
                                 int restore_w = 0, restore_h = 0;
                                 glfwGetWindowSize(window, &restore_w, &restore_h);
                                 term_window->size = WINDOW_SIZE(restore_w - 40, restore_h - 40);
@@ -3634,36 +3660,44 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             };
 
                             pty_child_pid_right = forkpty(&pty_master_fd_right, NULL, NULL, &ws);
-                            if (pty_child_pid_right == 0) {
-                                // Child process - forkpty already created session and controlling terminal
-                                // DO NOT call setsid()
-                                for (int fd = 3; fd < 256; fd++) close(fd);
-                                setenv("TERM", "xterm", 1);
-                                setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
-
-                                // Configure terminal for SSH compatibility
-                                struct termios tios;
-                                if (tcgetattr(STDIN_FILENO, &tios) == 0) {
-                                    tios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ISIG;
-                                    tios.c_oflag |= OPOST | ONLCR;
-                                    tios.c_iflag |= ICRNL | IXON;
-                                    tcsetattr(STDIN_FILENO, TCSANOW, &tios);
+                            if (pty_child_pid_right < 0) {
+                                // forkpty failed, so this pane has no shell. A
+                                // -1 used to fall through to the parent branch
+                                // below, which marked the pane interactive with
+                                // a closed fd - half a window that took input
+                                // and did nothing with it. Undo the split.
+                                perror("forkpty (right terminal)");
+                                pty_master_fd_right = -1;
+                                interactive_mode_right = false;
+                                if (term_window_right->font) {
+                                    FreeFont(term_window_right->font);
+                                    term_window_right->font = NULL;
                                 }
+                                wm_hide_window(&wm, term_window_right->name);
+                                term_window_right = NULL;
+                                split_side_by_side = false;
+                                focused_terminal = 0;
+                                restore_single_pane_layout(window);
+                                break;
+                            }
 
+                            if (pty_child_pid_right == 0) {
+                                // Child: becomes the shell for this pane
+                                configure_pty_child();
                                 exec_default_shell();
                                 _exit(1);
-                            } else {
-                                // Parent: set non-blocking
-                                int flags = fcntl(pty_master_fd_right, F_GETFL, 0);
-                                if (flags >= 0) {
-                                    fcntl(pty_master_fd_right, F_SETFL, flags | O_NONBLOCK);
-                                }
-                                interactive_mode_right = true;
-                                pty_start_time_right = glfwGetTime();
-
-                                // Set correct terminal size for the right PTY
-                                resize_pty_to_window_right();
                             }
+
+                            // Parent: set non-blocking
+                            int flags = fcntl(pty_master_fd_right, F_GETFL, 0);
+                            if (flags >= 0) {
+                                fcntl(pty_master_fd_right, F_SETFL, flags | O_NONBLOCK);
+                            }
+                            interactive_mode_right = true;
+                            pty_start_time_right = glfwGetTime();
+
+                            // Set the correct terminal size for this PTY
+                            resize_pty_to_window_right();
 
                             // CRITICAL: Create 9-slice for right terminal before showing
                             NineSliceParams right_params = {
@@ -3677,27 +3711,21 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             createNineSlice(&term_window_right->nine_slice, &right_params, WINDOW_SIZE(32, 32), term_window_right->texture_path.value);
 
                             wm_show_window(&wm, term_window_right->name);
-                            printf("Vertical split enabled - two independent terminals with separate fonts\n");
+                            printf("Side-by-side split enabled - two independent shells\n");
                         }
                         break;
                     case 6:  // Split Horizontal
                         printf("Split Horizontal selected\n");
-                        if (split_vertical) {
-                            // Already split horizontally (top/bottom) -> UNSPLIT
-                            printf("Unsplitting horizontal split...\n");
+                        if (split_stacked) {
+                            // Already stacked -> close the split
+                            printf("Closing the stacked split...\n");
 
-                            // Close bottom terminal PTY
-                            if (pty_master_fd_bottom >= 0) {
-                                close(pty_master_fd_bottom);
-                                pty_master_fd_bottom = -1;
-                            }
-
-                            // Kill bottom terminal child process
-                            if (pty_child_pid_bottom > 0) {
-                                kill(pty_child_pid_bottom, SIGTERM);
-                                waitpid(pty_child_pid_bottom, NULL, WNOHANG);
-                                pty_child_pid_bottom = -1;
-                            }
+                            // Close the PTY and reap the child. A SIGTERM followed straight
+                            // away by a WNOHANG wait almost never catches the exit, so every
+                            // closed split used to leave a zombie behind for the rest of the
+                            // session. shutdown_pty() hangs up, waits, and only then gives up
+                            // and uses SIGKILL.
+                            shutdown_pty(&pty_child_pid_bottom, &pty_master_fd_bottom);
 
                             // Free bottom terminal font
                             if (term_window_bottom && term_window_bottom->font) {
@@ -3723,45 +3751,18 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             }
 
                             // Reset split flag and focus
-                            split_vertical = false;
+                            split_stacked = false;
                             interactive_mode_bottom = false;
                             focused_terminal = 0;
 
-                            // Get current window size
-                            int current_width, current_height;
-                            glfwGetWindowSize(window, &current_width, &current_height);
+                            restore_single_pane_layout(window);
 
-                            // Restore main terminal to full size
-                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
-                            term_window->anchor = ANCHOR_CENTER;
-                            term_window->position = SCREEN_COORD(0, 0);
-
-                            // CRITICAL: Recreate 9-slice for restored full-size terminal
-                            NineSliceParams restore_params = {
-                                .position = SCREEN_COORD(0, 0),
-                                .size = term_window->size,
-                                .borderLeft = term_window->border_size,
-                                .borderRight = term_window->border_size,
-                                .borderTop = term_window->border_size,
-                                .borderBottom = term_window->border_size
-                            };
-                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
-
-                            // CRITICAL: Invalidate cache after size change
-                            invalidate_line_width_cache();
-
-                            // Rewrap main terminal content for new width
-                            rewrap_terminal_content();
-
-                            // Resize PTY
-                            resize_pty_to_window();
-
-                            printf("Horizontal split disabled - returned to single terminal\n");
-                        } else if (split_horizontal) {
-                            printf("Cannot split: terminal is already split vertically\n");
+                            printf("Stacked split closed - back to a single terminal\n");
+                        } else if (split_side_by_side) {
+                            printf("Cannot split: the terminal is already side by side\n");
                         } else {
-                            // Not split -> Split horizontally (top/bottom)
-                            split_vertical = true;
+                            // Not split -> stack two panes, top and bottom
+                            split_stacked = true;
                             focused_terminal = 0;
 
                             // Get current window size
@@ -3815,7 +3816,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             }
                             if (!term_window_bottom) {
                                 fprintf(stderr, "Cannot split: no window slots available\n");
-                                split_vertical = false;
+                                split_stacked = false;
                                 int restore_w = 0, restore_h = 0;
                                 glfwGetWindowSize(window, &restore_w, &restore_h);
                                 term_window->size = WINDOW_SIZE(restore_w - 40, restore_h - 40);
@@ -3888,36 +3889,44 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             };
 
                             pty_child_pid_bottom = forkpty(&pty_master_fd_bottom, NULL, NULL, &ws);
-                            if (pty_child_pid_bottom == 0) {
-                                // Child process - forkpty already created session and controlling terminal
-                                // DO NOT call setsid()
-                                for (int fd = 3; fd < 256; fd++) close(fd);
-                                setenv("TERM", "xterm", 1);
-                                setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
-
-                                // Configure terminal for SSH compatibility
-                                struct termios tios;
-                                if (tcgetattr(STDIN_FILENO, &tios) == 0) {
-                                    tios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ISIG;
-                                    tios.c_oflag |= OPOST | ONLCR;
-                                    tios.c_iflag |= ICRNL | IXON;
-                                    tcsetattr(STDIN_FILENO, TCSANOW, &tios);
+                            if (pty_child_pid_bottom < 0) {
+                                // forkpty failed, so this pane has no shell. A
+                                // -1 used to fall through to the parent branch
+                                // below, which marked the pane interactive with
+                                // a closed fd - half a window that took input
+                                // and did nothing with it. Undo the split.
+                                perror("forkpty (bottom terminal)");
+                                pty_master_fd_bottom = -1;
+                                interactive_mode_bottom = false;
+                                if (term_window_bottom->font) {
+                                    FreeFont(term_window_bottom->font);
+                                    term_window_bottom->font = NULL;
                                 }
+                                wm_hide_window(&wm, term_window_bottom->name);
+                                term_window_bottom = NULL;
+                                split_stacked = false;
+                                focused_terminal = 0;
+                                restore_single_pane_layout(window);
+                                break;
+                            }
 
+                            if (pty_child_pid_bottom == 0) {
+                                // Child: becomes the shell for this pane
+                                configure_pty_child();
                                 exec_default_shell();
                                 _exit(1);
-                            } else {
-                                // Parent: set non-blocking
-                                int flags = fcntl(pty_master_fd_bottom, F_GETFL, 0);
-                                if (flags >= 0) {
-                                    fcntl(pty_master_fd_bottom, F_SETFL, flags | O_NONBLOCK);
-                                }
-                                interactive_mode_bottom = true;
-                                pty_start_time_bottom = glfwGetTime();
-
-                                // Set correct terminal size for the bottom PTY
-                                resize_pty_to_window_bottom();
                             }
+
+                            // Parent: set non-blocking
+                            int flags = fcntl(pty_master_fd_bottom, F_GETFL, 0);
+                            if (flags >= 0) {
+                                fcntl(pty_master_fd_bottom, F_SETFL, flags | O_NONBLOCK);
+                            }
+                            interactive_mode_bottom = true;
+                            pty_start_time_bottom = glfwGetTime();
+
+                            // Set the correct terminal size for this PTY
+                            resize_pty_to_window_bottom();
 
                             // CRITICAL: Create 9-slice for bottom terminal before showing
                             NineSliceParams bottom_params = {
@@ -3931,27 +3940,21 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             createNineSlice(&term_window_bottom->nine_slice, &bottom_params, WINDOW_SIZE(32, 32), term_window_bottom->texture_path.value);
 
                             wm_show_window(&wm, term_window_bottom->name);
-                            printf("Horizontal split enabled - two independent terminals (top/bottom)\n");
+                            printf("Stacked split enabled - two independent shells\n");
                         }
                         break;
                     case 7:  // Close Split
                         printf("Close Split selected\n");
-                        if (split_horizontal) {
-                            // Close vertical split (left/right)
-                            printf("Closing vertical split...\n");
+                        if (split_side_by_side) {
+                            // Two panes side by side -> back to one
+                            printf("Closing the side-by-side split...\n");
 
-                            // Close right terminal PTY
-                            if (pty_master_fd_right >= 0) {
-                                close(pty_master_fd_right);
-                                pty_master_fd_right = -1;
-                            }
-
-                            // Kill right terminal child process
-                            if (pty_child_pid_right > 0) {
-                                kill(pty_child_pid_right, SIGTERM);
-                                waitpid(pty_child_pid_right, NULL, WNOHANG);
-                                pty_child_pid_right = -1;
-                            }
+                            // Close the PTY and reap the child. A SIGTERM followed straight
+                            // away by a WNOHANG wait almost never catches the exit, so every
+                            // closed split used to leave a zombie behind for the rest of the
+                            // session. shutdown_pty() hangs up, waits, and only then gives up
+                            // and uses SIGKILL.
+                            shutdown_pty(&pty_child_pid_right, &pty_master_fd_right);
 
                             // Free right terminal font
                             if (term_window_right && term_window_right->font) {
@@ -3977,56 +3980,23 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             }
 
                             // Reset split flag and focus
-                            split_horizontal = false;
+                            split_side_by_side = false;
                             interactive_mode_right = false;
                             focused_terminal = 0;
 
-                            // Get current window size
-                            int current_width, current_height;
-                            glfwGetWindowSize(window, &current_width, &current_height);
+                            restore_single_pane_layout(window);
 
-                            // Restore main terminal to full size
-                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
-                            term_window->anchor = ANCHOR_CENTER;
-                            term_window->position = SCREEN_COORD(0, 0);
+                            printf("Side-by-side split closed - back to a single terminal\n");
+                        } else if (split_stacked) {
+                            // Two panes stacked -> back to one
+                            printf("Closing the stacked split...\n");
 
-                            // CRITICAL: Recreate 9-slice for restored full-size terminal
-                            NineSliceParams restore_params = {
-                                .position = SCREEN_COORD(0, 0),
-                                .size = term_window->size,
-                                .borderLeft = term_window->border_size,
-                                .borderRight = term_window->border_size,
-                                .borderTop = term_window->border_size,
-                                .borderBottom = term_window->border_size
-                            };
-                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
-
-                            // CRITICAL: Invalidate cache after size change
-                            invalidate_line_width_cache();
-
-                            // Rewrap main terminal content for new width
-                            rewrap_terminal_content();
-
-                            // Resize PTY
-                            resize_pty_to_window();
-
-                            printf("Vertical split closed - returned to single terminal\n");
-                        } else if (split_vertical) {
-                            // Close horizontal split (top/bottom)
-                            printf("Closing horizontal split...\n");
-
-                            // Close bottom terminal PTY
-                            if (pty_master_fd_bottom >= 0) {
-                                close(pty_master_fd_bottom);
-                                pty_master_fd_bottom = -1;
-                            }
-
-                            // Kill bottom terminal child process
-                            if (pty_child_pid_bottom > 0) {
-                                kill(pty_child_pid_bottom, SIGTERM);
-                                waitpid(pty_child_pid_bottom, NULL, WNOHANG);
-                                pty_child_pid_bottom = -1;
-                            }
+                            // Close the PTY and reap the child. A SIGTERM followed straight
+                            // away by a WNOHANG wait almost never catches the exit, so every
+                            // closed split used to leave a zombie behind for the rest of the
+                            // session. shutdown_pty() hangs up, waits, and only then gives up
+                            // and uses SIGKILL.
+                            shutdown_pty(&pty_child_pid_bottom, &pty_master_fd_bottom);
 
                             // Free bottom terminal font
                             if (term_window_bottom && term_window_bottom->font) {
@@ -4052,40 +4022,13 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             }
 
                             // Reset split flag and focus
-                            split_vertical = false;
+                            split_stacked = false;
                             interactive_mode_bottom = false;
                             focused_terminal = 0;
 
-                            // Get current window size
-                            int current_width, current_height;
-                            glfwGetWindowSize(window, &current_width, &current_height);
+                            restore_single_pane_layout(window);
 
-                            // Restore main terminal to full size
-                            term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
-                            term_window->anchor = ANCHOR_CENTER;
-                            term_window->position = SCREEN_COORD(0, 0);
-
-                            // CRITICAL: Recreate 9-slice for restored full-size terminal
-                            NineSliceParams restore_params = {
-                                .position = SCREEN_COORD(0, 0),
-                                .size = term_window->size,
-                                .borderLeft = term_window->border_size,
-                                .borderRight = term_window->border_size,
-                                .borderTop = term_window->border_size,
-                                .borderBottom = term_window->border_size
-                            };
-                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
-
-                            // CRITICAL: Invalidate cache after size change
-                            invalidate_line_width_cache();
-
-                            // Rewrap main terminal content for new width
-                            rewrap_terminal_content();
-
-                            // Resize PTY
-                            resize_pty_to_window();
-
-                            printf("Horizontal split closed - returned to single terminal\n");
+                            printf("Stacked split closed - back to a single terminal\n");
                         } else {
                             printf("No split to close - already in single terminal mode\n");
                         }
@@ -4199,8 +4142,8 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
     invalidate_line_width_cache();
 
     // Update terminal window sizes
-    if (split_horizontal) {
-        // Recalculate horizontal split sizes (left/right) - COMPLETELY reset layout
+    if (split_side_by_side) {
+        // Recalculate the side-by-side pane sizes - COMPLETELY reset layout
         int usable_width = width - (WINDOW_EDGE_PADDING * 2);
         int usable_height = height - (WINDOW_EDGE_PADDING * 2);
         int half_width = (usable_width - TERMINAL_GAP) / 2;
@@ -4233,8 +4176,8 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
             term_window_right->border_size = term_window->border_size;
 
         }
-    } else if (split_vertical) {
-        // Recalculate vertical split sizes (top/bottom) - COMPLETELY reset layout
+    } else if (split_stacked) {
+        // Recalculate the stacked pane sizes - COMPLETELY reset layout
         int usable_width = width - (WINDOW_EDGE_PADDING * 2);
         int usable_height = height - (WINDOW_EDGE_PADDING * 2);
         int half_height = (usable_height - TERMINAL_GAP) / 2;
@@ -4282,9 +4225,9 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
 
     // Notify PTY of resize - this updates TIOCSWINSZ for interactive programs
     resize_pty_to_window();
-    if (split_horizontal) {
+    if (split_side_by_side) {
         resize_pty_to_window_right();
-    } else if (split_vertical) {
+    } else if (split_stacked) {
         resize_pty_to_window_bottom();
     }
 
@@ -4546,10 +4489,10 @@ int main(int argc, char** argv) {
             ansi_term.cursor_visible = !ansi_term.cursor_visible;
 
             // Also update split terminal cursors
-            if (split_horizontal) {
+            if (split_side_by_side) {
                 terminal_right.cursor_visible = !terminal_right.cursor_visible;
                 ansi_term_right.cursor_visible = !ansi_term_right.cursor_visible;
-            } else if (split_vertical) {
+            } else if (split_stacked) {
                 terminal_bottom.cursor_visible = !terminal_bottom.cursor_visible;
                 ansi_term_bottom.cursor_visible = !ansi_term_bottom.cursor_visible;
             }
@@ -4563,7 +4506,7 @@ int main(int argc, char** argv) {
             static int last_layout = -1;
             static float last_font_size = -1.0f;
 
-            int layout = (split_horizontal ? 1 : 0) | (split_vertical ? 2 : 0);
+            int layout = (split_side_by_side ? 1 : 0) | (split_stacked ? 2 : 0);
             float font_now = term_window ? term_window->font_size.value : 1.0f;
 
             if (layout != last_layout || font_now != last_font_size) {
@@ -4577,9 +4520,9 @@ int main(int argc, char** argv) {
         poll_pty();
 
         // Poll second terminal PTY if split
-        if (split_horizontal) {
+        if (split_side_by_side) {
             poll_pty_right();
-        } else if (split_vertical) {
+        } else if (split_stacked) {
             poll_pty_bottom();
         }
 
@@ -4594,9 +4537,9 @@ int main(int argc, char** argv) {
         render_terminal_content();
 
         // Render second terminal if split
-        if (split_horizontal) {
+        if (split_side_by_side) {
             render_terminal_content_right();
-        } else if (split_vertical) {
+        } else if (split_stacked) {
             render_terminal_content_bottom();
         }
 
