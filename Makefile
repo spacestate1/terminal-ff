@@ -1,9 +1,9 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -I../../includes -I. -std=c11
-LIBS = -lglfw -lGLEW -lGL -lm
+LIBS = -lglfw -lGLEW -lGL -lm -lasound -lmpg123 -lpthread
 
 # Source files
-SRCS = terminal.c window_manager_working.c font-render.c ansi.c
+SRCS = terminal.c window_manager_working.c font-render.c ansi.c sound.c
 OBJS = $(SRCS:.c=.o)
 
 # Output binary
@@ -14,8 +14,11 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LIBS)
 
-terminal.o: terminal.c window_manager.h font-render.h types.h
+terminal.o: terminal.c window_manager.h font-render.h types.h sound.h
 	$(CC) $(CFLAGS) -c terminal.c
+
+sound.o: sound.c sound.h
+	$(CC) $(CFLAGS) -c sound.c
 
 window_manager_working.o: window_manager_working.c window_manager.h font-render.h types.h
 	$(CC) $(CFLAGS) -c window_manager_working.c
