@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#include <time.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -730,6 +731,13 @@ void poll_pty() {
                 ansi_process_output(&ansi_term, buf, (int)n);
             }
             // Continue reading to drain any remaining buffered data
+        } else if (n == -1 && errno == EINTR) {
+            // A signal landed mid-read. The shutdown handler deliberately does
+            // not use SA_RESTART - restarting this read is what stopped the
+            // loop from ever noticing the flag - so treat it as "nothing right
+            // now" and come back on the next poll rather than as an error,
+            // which would tear the session down.
+            break;
         } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // no more data right now - safe to exit if child has exited
             if (child_exited) {
@@ -803,6 +811,13 @@ void poll_pty_right() {
                 ansi_process_output(&ansi_term_right, buf, (int)n);
             }
             // Continue reading to drain buffered data
+        } else if (n == -1 && errno == EINTR) {
+            // A signal landed mid-read. The shutdown handler deliberately does
+            // not use SA_RESTART - restarting this read is what stopped the
+            // loop from ever noticing the flag - so treat it as "nothing right
+            // now" and come back on the next poll rather than as an error,
+            // which would tear the session down.
+            break;
         } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // no more data - safe to exit if child has exited
             if (child_exited) {
@@ -866,6 +881,13 @@ void poll_pty_bottom() {
                 ansi_process_output(&ansi_term_bottom, buf, (int)n);
             }
             // Continue reading to drain buffered data
+        } else if (n == -1 && errno == EINTR) {
+            // A signal landed mid-read. The shutdown handler deliberately does
+            // not use SA_RESTART - restarting this read is what stopped the
+            // loop from ever noticing the flag - so treat it as "nothing right
+            // now" and come back on the next poll rather than as an error,
+            // which would tear the session down.
+            break;
         } else if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // no more data - safe to exit if child has exited
             if (child_exited) {
@@ -4269,6 +4291,49 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
     DEBUG_PRINT("Window resized to: %dx%d\n", width, height);
 }
 
+// Set by the signal handler so the main loop can leave through the usual
+// teardown. A handler cannot safely call into GLFW or free anything, so it
+// does nothing but raise this flag.
+static volatile sig_atomic_t shutdown_requested = 0;
+
+static void request_shutdown(int sig) {
+    (void)sig;
+    shutdown_requested = 1;
+}
+
+// Stop a PTY child and reap it. SIGHUP first, which is what a real terminal
+// sends when its window goes away and what lets a shell run its exit traps;
+// SIGKILL only for something that ignores it. Closing the master first also
+// gives the child EOF on its stdin, so a well-behaved shell is usually gone
+// before the signal arrives.
+static void shutdown_pty(pid_t* pid, int* master_fd) {
+    if (*master_fd != -1) {
+        close(*master_fd);
+        *master_fd = -1;
+    }
+
+    if (*pid <= 0) {
+        *pid = -1;
+        return;
+    }
+
+    kill(*pid, SIGHUP);
+
+    // Wait briefly rather than blocking forever on a wedged child.
+    for (int i = 0; i < 200; i++) {
+        if (waitpid(*pid, NULL, WNOHANG) == *pid) {
+            *pid = -1;
+            return;
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };  // 1 ms
+        nanosleep(&ts, NULL);
+    }
+
+    kill(*pid, SIGKILL);
+    waitpid(*pid, NULL, 0);
+    *pid = -1;
+}
+
 // GLFW error callback for debugging
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
@@ -4330,9 +4395,9 @@ int main(int argc, char** argv) {
     glfwMakeContextCurrent(window);
     printf("OpenGL context created successfully\n");
 
-    // LOW LATENCY: Disable VSync for minimal input lag (trades screen tearing for responsiveness)
-    // Set to 1 for VSync (no tearing but +1 frame latency), 0 for no VSync (immediate, may tear)
-    glfwSwapInterval(0);  // 0 = maximum performance, lowest latency
+    // Swap without waiting on the compositor. The loop is paced by hand at the
+    // bottom instead - see the note there for why vsync cannot do this job.
+    glfwSwapInterval(0);
 
     glfwSetKeyCallback(window, key_callback);
     glfwSetCharCallback(window, char_callback);
@@ -4432,9 +4497,36 @@ int main(int argc, char** argv) {
     printf("  F8/F9    - Font size (increase/decrease)\n");
     printf("  F10/F11  - Adjust left margin (right/left)\n");
 
+    // Leave by the same route however we are asked to. Without this,
+    // SIGINT/SIGTERM/SIGHUP kill the process outright: the child shells are
+    // never signalled, the ALSA device is left open, and the teardown below
+    // never runs.
+    //
+    // This has to happen here, not early in main(). Pulling in the font and
+    // image stack starts glib (the gmain/gdbus/dconf threads), and it installs
+    // handlers of its own during init - anything registered beforehand gets
+    // replaced. Registering last is what makes ours the one that runs.
+    //
+    // No SA_RESTART: the loop can be parked in poll() inside the compositor's
+    // frame wait, and restarting that syscall would swallow the signal until
+    // the next frame - which never arrives if the window is hidden. Letting it
+    // fail with EINTR is what wakes the loop up to see the flag.
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = request_shutdown;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT,  &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP,  &sa, NULL);
+    }
+
     // Main loop
     double last_time = glfwGetTime();
-    while (!glfwWindowShouldClose(window)) {
+    while (!glfwWindowShouldClose(window) && !shutdown_requested) {
+        double frame_start = glfwGetTime();
+
         // LOW LATENCY: Poll events FIRST to minimize input-to-frame delay
         glfwPollEvents();
 
@@ -4513,13 +4605,69 @@ int main(int argc, char** argv) {
 
         glfwSwapBuffers(window);
         // Note: glfwPollEvents() moved to top of loop for lower latency
+
+        // Pace the loop to ~60 FPS.
+        //
+        // Left to run flat out it renders thousands of frames a second and
+        // commits a surface for each one. The compositor consumes them at the
+        // refresh rate at best, and libwayland-client queues every one that is
+        // not consumed: ~11,000 allocations a second, around 2.5 MB/s, growing
+        // until the OOM killer ends the process with a bare "Killed". Capping
+        // the rate is what bounds that queue.
+        //
+        // Vsync looks like the obvious way to do this and is the wrong tool:
+        // glfwSwapBuffers() would then block until the compositor sends a frame
+        // callback, and it sends none to a surface that is not on screen. A
+        // hidden, minimised, or never-mapped window parks the loop forever -
+        // no PTY reads, no input, and no chance to notice a shutdown signal.
+        // Measured here: with vsync on, the loop blocked in its first swap and
+        // never completed a second iteration.
+        //
+        // Sleeping out the remainder of the frame keeps the rate bounded while
+        // control stays with us. A signal cuts the sleep short, which is what
+        // makes shutdown prompt.
+        {
+            const double frame_budget = 1.0 / 60.0;
+            double spent = glfwGetTime() - frame_start;
+
+            if (spent < frame_budget) {
+                double remaining = frame_budget - spent;
+                struct timespec ts = {
+                    .tv_sec  = (time_t)remaining,
+                    .tv_nsec = (long)((remaining - (double)(time_t)remaining) * 1e9)
+                };
+                nanosleep(&ts, NULL);
+            }
+        }
     }
 
-    // Cleanup
+    // Cleanup. The children go first: once this process exits they would be
+    // reparented to init and left running with no terminal attached, which is
+    // how a session leaks a stray shell every time the window closes.
+    shutdown_pty(&pty_child_pid,        &pty_master_fd);
+    shutdown_pty(&pty_child_pid_right,  &pty_master_fd_right);
+    shutdown_pty(&pty_child_pid_bottom, &pty_master_fd_bottom);
+
+    // Fonts hold a GL texture and a vertex buffer each, so they have to go
+    // before the context does.
+    if (term_window && term_window->font) {
+        FreeFont(term_window->font);
+        term_window->font = NULL;
+    }
+    if (term_window_right && term_window_right->font) {
+        FreeFont(term_window_right->font);
+        term_window_right->font = NULL;
+    }
+    if (term_window_bottom && term_window_bottom->font) {
+        FreeFont(term_window_bottom->font);
+        term_window_bottom->font = NULL;
+    }
+
     sound_shutdown();
     wm_cleanup(&wm);
     glfwDestroyWindow(window);
     glfwTerminate();
 
+    printf("Terminal closed cleanly\n");
     return 0;
 }
