@@ -15,6 +15,18 @@ void scroll_text_up_one_line(char* text);
 
 // 9-slice rendering implementation
 void createNineSlice(NineSlice* nineSlice, NineSliceParams* params, WindowSize texture_size, const char* texture_path) {
+    // Release any texture this slice already owns. The border geometry is
+    // rebuilt from the window size on every frame, so callers only ever need
+    // to do this once - but when it was called again (it used to be, on every
+    // resize event) each call leaked a GL texture. Enough of those and
+    // loadTexture starts returning 0, which drops the window to the untextured
+    // fallback rectangle and makes the border look broken.
+    if (nineSlice->texture.id != 0) {
+        GLuint previous = nineSlice->texture.id;
+        glDeleteTextures(1, &previous);
+        nineSlice->texture = INVALID_TEXTURE_ID;
+    }
+
     // Load the 9-slice texture
     nineSlice->texture = TEXTURE_ID(loadTexture(texture_path));
     nineSlice->vao = 0;

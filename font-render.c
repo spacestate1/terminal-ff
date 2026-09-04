@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// STB_IMAGE_IMPLEMENTATION is defined in stb_image_impl.c
+// STB_IMAGE_IMPLEMENTATION is defined in terminal.c (only one implementation unit)
 #include "stb_image.h"
 
 #define PL_JSON_IMPLEMENTATION
@@ -189,6 +189,39 @@ FontInfo* LoadFont(const char* json_filename, const char* texture_filename) {
         return NULL;
     }
 
+    // OPTIMIZATION: Cache texture dimensions to avoid expensive glGet calls during rendering
+    int width, height;
+    glBindTexture(GL_TEXTURE_2D, font_info->texture);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    font_info->tex_width = width;
+    font_info->tex_height = height;
+
+    // OPTIMIZATION: Initialize VBO for batched rendering
+    // Allocate buffer for ~10,000 characters (enough for large terminal)
+    // Each char = 6 vertices (2 triangles), each vertex = 4 floats (x, y, u, v)
+    font_info->vertex_buffer_capacity = 10000 * 6 * 4;
+    font_info->vertex_buffer = malloc(font_info->vertex_buffer_capacity * sizeof(float));
+    if (!font_info->vertex_buffer) {
+        fprintf(stderr, "Failed to allocate vertex buffer\n");
+        FreeFont(font_info);
+        return NULL;
+    }
+
+    // Generate VBO (no VAO needed for legacy OpenGL)
+    glGenBuffers(1, &font_info->vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, font_info->vbo);
+
+    // Allocate GPU buffer (dynamic draw pattern)
+    glBufferData(GL_ARRAY_BUFFER,
+                 font_info->vertex_buffer_capacity * sizeof(float),
+                 NULL, GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // Note: VAO not used in legacy OpenGL mode
+    font_info->vao = 0;
+
     return font_info;
 }
 
@@ -197,6 +230,11 @@ void FreeFont(FontInfo* font_info) {
     if (font_info) {
         free(font_info->metrics);
         glDeleteTextures(1, &font_info->texture);
+
+        // Clean up VBO resources
+        if (font_info->vbo) glDeleteBuffers(1, &font_info->vbo);
+        if (font_info->vertex_buffer) free(font_info->vertex_buffer);
+
         free(font_info);
     }
 }
@@ -204,7 +242,9 @@ void FreeFont(FontInfo* font_info) {
 
 void RenderCharacter(GLuint texture, FontInfo *font_info, char c, float x, float y, float font_size) {
     int char_index = c - font_info->first_char;
-    if (char_index < 0 || char_index >= font_info->last_char - font_info->first_char) {
+    int glyph_count = font_info->last_char - font_info->first_char + 1;
+
+    if (char_index < 0 || char_index >= glyph_count) {
         printf("Character '%c' (ASCII %d) not in font range\n", c, (int)c);
         return;
     }
@@ -225,10 +265,9 @@ void RenderCharacter(GLuint texture, FontInfo *font_info, char c, float x, float
     int offset_y = font_info->metrics[metric_index + 5];
     // int advance_x = font_info->metrics[metric_index + 6];  // Commented out as unused
 
-    GLint tex_width, tex_height;
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tex_width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_height);
+    // OPTIMIZATION: Use cached texture dimensions instead of expensive glGet calls
+    float tex_width = (float)font_info->tex_width;
+    float tex_height = (float)font_info->tex_height;
 
     // Improved baseline calculation for consistent vertical alignment
     float char_x = x + offset_x * font_size;
@@ -257,44 +296,141 @@ void RenderCharacter(GLuint texture, FontInfo *font_info, char c, float x, float
 }
 
 
-void RenderText(FontInfo *font_info, const char* text, float x, float y, float font_size, float line_spacing) {
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, font_info->texture);
-    
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+// OPTIMIZED: Batched rendering using VBO - renders all characters in one draw call.
+// Draws with whatever the current GL colour is; the wrappers below set it.
+static void render_text_batch(FontInfo *font_info, const char* text, float x, float y, float font_size, float line_spacing) {
+    if (!font_info || !text || !font_info->vertex_buffer) return;
 
     float start_x = x;
     float line_height = font_size * font_info->height * line_spacing;
-    
+    float tex_width = (float)font_info->tex_width;
+    float tex_height = (float)font_info->tex_height;
+    int glyph_count = font_info->last_char - font_info->first_char + 1;
+
+    // Build vertex buffer for all characters
+    int vertex_count = 0;
+    float* vbuf = font_info->vertex_buffer;
+    int max_vertices = font_info->vertex_buffer_capacity;
+
     while (*text) {
         if (*text == '\n') {
             x = start_x;
             y += line_height;
-        } else {
-            // Check if character is in range before rendering
-            int char_index = *text - font_info->first_char;
-            if (char_index >= 0 && char_index < font_info->last_char - font_info->first_char) {
-                RenderCharacter(font_info->texture, font_info, *text, x, y, font_size);
-                x += font_size * font_info->metrics[((*text) - font_info->first_char) * 7 + 6]; // advance_x
-            } else {
-                // Either skip the character or render a default one (like '?')
-                // Assuming '?' is in your font range
-                char replacement = '?';
-                if (replacement >= font_info->first_char && replacement <= font_info->last_char) {
-                    RenderCharacter(font_info->texture, font_info, replacement, x, y, font_size);
-                    x += font_size * font_info->metrics[(replacement - font_info->first_char) * 7 + 6];
-                } else {
-                    // If even the replacement is out of range, just advance by a default amount
-                    x += font_size * 5; // Default advance amount
-                }
+            text++;
+            continue;
+        }
+
+        // Check if character is in range
+        int char_index = *text - font_info->first_char;
+        if (char_index < 0 || char_index >= glyph_count) {
+            // Try replacement character
+            char_index = '?' - font_info->first_char;
+            if (char_index < 0 || char_index >= glyph_count) {
+                x += font_size * 5; // Default advance
+                text++;
+                continue;
             }
         }
+
+        int metric_index = char_index * 7;
+        if (metric_index + 6 >= font_info->metrics_count) {
+            text++;
+            continue;
+        }
+
+        // Get character metrics
+        int tex_x = font_info->metrics[metric_index];
+        int tex_y = font_info->metrics[metric_index + 1];
+        int width = font_info->metrics[metric_index + 2];
+        int height = font_info->metrics[metric_index + 3];
+        int offset_x = font_info->metrics[metric_index + 4];
+        int offset_y = font_info->metrics[metric_index + 5];
+        int advance_x = font_info->metrics[metric_index + 6];
+
+        // Calculate character position
+        float char_x = x + offset_x * font_size;
+        float char_y = y + offset_y * font_size;
+        float char_w = width * font_size;
+        float char_h = height * font_size;
+
+        // Calculate texture coordinates
+        float u1 = (float)tex_x / tex_width;
+        float v1 = (float)tex_y / tex_height;
+        float u2 = (float)(tex_x + width) / tex_width;
+        float v2 = (float)(tex_y + height) / tex_height;
+
+        // Check buffer capacity (6 vertices * 4 floats per char)
+        if (vertex_count + 24 > max_vertices) {
+            break; // Buffer full
+        }
+
+        // Triangle 1 (top-left, top-right, bottom-left)
+        vbuf[vertex_count++] = char_x;           vbuf[vertex_count++] = char_y;
+        vbuf[vertex_count++] = u1;               vbuf[vertex_count++] = v1;
+
+        vbuf[vertex_count++] = char_x + char_w; vbuf[vertex_count++] = char_y;
+        vbuf[vertex_count++] = u2;               vbuf[vertex_count++] = v1;
+
+        vbuf[vertex_count++] = char_x;           vbuf[vertex_count++] = char_y + char_h;
+        vbuf[vertex_count++] = u1;               vbuf[vertex_count++] = v2;
+
+        // Triangle 2 (top-right, bottom-right, bottom-left)
+        vbuf[vertex_count++] = char_x + char_w; vbuf[vertex_count++] = char_y;
+        vbuf[vertex_count++] = u2;               vbuf[vertex_count++] = v1;
+
+        vbuf[vertex_count++] = char_x + char_w; vbuf[vertex_count++] = char_y + char_h;
+        vbuf[vertex_count++] = u2;               vbuf[vertex_count++] = v2;
+
+        vbuf[vertex_count++] = char_x;           vbuf[vertex_count++] = char_y + char_h;
+        vbuf[vertex_count++] = u1;               vbuf[vertex_count++] = v2;
+
+        x += font_size * advance_x;
         text++;
     }
 
+    // If no vertices, nothing to draw
+    if (vertex_count == 0) return;
+
+    // Enable OpenGL state
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindTexture(GL_TEXTURE_2D, font_info->texture);
+
+    // Upload vertices and draw using legacy client states (compatible with existing OpenGL context)
+    glBindBuffer(GL_ARRAY_BUFFER, font_info->vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * sizeof(float), vbuf);
+
+    // Enable client states for legacy OpenGL
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    // Set pointers (stride = 4 floats: x, y, u, v)
+    glVertexPointer(2, GL_FLOAT, 4 * sizeof(float), (void*)0);
+    glTexCoordPointer(2, GL_FLOAT, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+    // Draw in ONE call
+    glDrawArrays(GL_TRIANGLES, 0, vertex_count / 4);
+
+    // Cleanup
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     glDisable(GL_BLEND);
     glDisable(GL_TEXTURE_2D);
+}
+
+void RenderText(FontInfo *font_info, const char* text, float x, float y, float font_size, float line_spacing) {
+    render_text_batch(font_info, text, x, y, font_size, line_spacing);
+}
+
+// Same as RenderText but tints the batch. Sets the current GL colour as a side
+// effect - callers mixing coloured and uncoloured text must restore it.
+void RenderTextColored(FontInfo *font_info, const char* text, float x, float y,
+                       float font_size, float line_spacing,
+                       float r, float g, float b, float a) {
+    glColor4f(r, g, b, a);
+    render_text_batch(font_info, text, x, y, font_size, line_spacing);
 }
 
 // Get average character width for terminal layout calculations
@@ -307,14 +443,15 @@ float GetAverageCharWidth(FontInfo *font_info, float font_size) {
     // Get the advance_x for 'M' which is typically representative
     char test_char = 'M';
     int char_index = test_char - font_info->first_char;
+    int glyph_count = font_info->last_char - font_info->first_char + 1;
 
-    if (char_index < 0 || char_index >= font_info->last_char - font_info->first_char) {
+    if (char_index < 0 || char_index >= glyph_count) {
         // Try space character as fallback
         test_char = ' ';
         char_index = test_char - font_info->first_char;
     }
 
-    if (char_index >= 0 && char_index < font_info->last_char - font_info->first_char) {
+    if (char_index >= 0 && char_index < glyph_count) {
         int metric_index = char_index * 7;
         // Defensive bounds check before accessing metrics array
         if (metric_index + 6 >= font_info->metrics_count) {

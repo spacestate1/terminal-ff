@@ -23,6 +23,18 @@
 #include "window_manager.h"
 #include "font-render.h"
 #include "ansi.h"
+#include "sound.h"
+
+// Played on Enter. Relative to the exe directory, like the font and UI assets.
+#define ENTER_SOUND_PATH "assets/sounds/enter_sound.mp3"
+
+// LOW LATENCY: Disable verbose debug output for production builds
+// Compile with -DDEBUG_VERBOSE to enable detailed logging
+#ifdef DEBUG_VERBOSE
+    #define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(...) ((void)0)  // No-op
+#endif
 
 #define WINDOW_WIDTH 1200
 #define WINDOW_HEIGHT 800
@@ -66,6 +78,13 @@ int pty_master_fd = -1;
 pid_t pty_child_pid = -1;
 bool interactive_mode = false;
 double pty_start_time = 0.0;  // Timestamp when PTY was started
+int ansi_scroll_offset = 0;  // Manual scroll offset for ANSI buffer (0 = follow cursor)
+
+// Tab completion state
+double last_tab_time = 0.0;
+char last_tab_completion[MAX_LINE_LENGTH] = "";
+// Holds "<dir>/<match>", so it needs room for two MAX_LINE_LENGTH components.
+char last_completed_path[MAX_LINE_LENGTH * 2] = "";
 
 // Split terminal state
 bool split_horizontal = false;  // Left/right split
@@ -81,6 +100,7 @@ int pty_master_fd_right = -1;
 pid_t pty_child_pid_right = -1;
 bool interactive_mode_right = false;
 double pty_start_time_right = 0.0;
+int ansi_scroll_offset_right = 0;  // Manual scroll offset for right ANSI buffer
 
 // Bottom terminal state (for independent split terminal - vertical split)
 TerminalState terminal_bottom = {0};
@@ -89,6 +109,7 @@ int pty_master_fd_bottom = -1;
 pid_t pty_child_pid_bottom = -1;
 bool interactive_mode_bottom = false;
 double pty_start_time_bottom = 0.0;
+int ansi_scroll_offset_bottom = 0;  // Manual scroll offset for bottom ANSI buffer
 
 // Context menu
 typedef struct {
@@ -100,6 +121,9 @@ typedef struct {
 } ContextMenu;
 
 ContextMenu context_menu = {false, 0, 0, -1, 0, 0, 22.0f};  // Default offset = 22
+
+// OPTIMIZATION: Cache line width calculation to avoid repeated computation
+int cached_line_width = -1;  // -1 = not yet calculated
 
 #define MENU_ITEM_HEIGHT 30.0f
 #define MENU_WIDTH 280.0f
@@ -113,9 +137,21 @@ const char* menu_items[] = {
     "Split Vertical",
     "Split Horizontal",
     "Close Split",
+    "Sound: On",     // label is replaced at draw time by menu_item_label()
     "Exit"
 };
-#define MENU_ITEM_COUNT 9
+#define MENU_ITEM_COUNT 10
+#define MENU_ITEM_SOUND 8
+
+// Label for a menu row. Everything is static except the sound entry, which
+// shows what a click will do next.
+static const char* menu_item_label(int index) {
+    if (index == MENU_ITEM_SOUND) {
+        if (!sound_is_available()) return "Sound: unavailable";
+        return sound_is_enabled() ? "Sound: On" : "Sound: Off";
+    }
+    return menu_items[index];
+}
 
 // Function declarations
 GLuint loadTexture(const char* path);
@@ -131,12 +167,46 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 void char_callback(GLFWwindow* window, unsigned int codepoint);
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods);
 void cursor_position_callback(GLFWwindow* window, double xpos, double ypos);
+void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
+
+// Convert Unicode codepoint to UTF-8 bytes
+// Returns number of bytes written (1-4), or 0 if codepoint is invalid
+// NOTE: Current font rendering only supports ASCII (32-126), so non-ASCII
+// characters will be sent to PTY as UTF-8 but may display as '?' or box chars
+static int codepoint_to_utf8(unsigned int codepoint, char* out) {
+    if (codepoint < 0x80) {
+        // 1-byte ASCII
+        out[0] = (char)codepoint;
+        return 1;
+    } else if (codepoint < 0x800) {
+        // 2-byte sequence
+        out[0] = (char)(0xC0 | (codepoint >> 6));
+        out[1] = (char)(0x80 | (codepoint & 0x3F));
+        return 2;
+    } else if (codepoint < 0x10000) {
+        // 3-byte sequence
+        out[0] = (char)(0xE0 | (codepoint >> 12));
+        out[1] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (codepoint & 0x3F));
+        return 3;
+    } else if (codepoint < 0x110000) {
+        // 4-byte sequence
+        out[0] = (char)(0xF0 | (codepoint >> 18));
+        out[1] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (codepoint & 0x3F));
+        return 4;
+    }
+    return 0; // Invalid codepoint
+}
 
 // Load texture function (for 9-slice borders)
 GLuint loadTexture(const char* path) {
     int width, height, nrChannels;
     stbi_set_flip_vertically_on_load(0);  // Don't flip - 9-slice coordinates expect non-flipped
-    unsigned char* data = stbi_load(path, &width, &height, &nrChannels, 0);
+
+    // CRITICAL: Force 4 channels to prevent buffer overrun with 1/2 channel images
+    unsigned char* data = stbi_load(path, &width, &height, &nrChannels, 4);
 
     if (!data) {
         printf("Failed to load texture: %s\n", path);
@@ -152,11 +222,11 @@ GLuint loadTexture(const char* path) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    GLenum format = (nrChannels == 4) ? GL_RGBA : GL_RGB;
-    glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+    // Data is always RGBA now due to forced conversion
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 
     stbi_image_free(data);
-    printf("Loaded texture: %s (%dx%d, %d channels)\n", path, width, height, nrChannels);
+    printf("Loaded texture: %s (%dx%d, %d channels -> RGBA)\n", path, width, height, nrChannels);
 
     return texture;
 }
@@ -192,8 +262,43 @@ void terminal_load_history() {
         // Skip empty lines
         if (strlen(line) == 0) continue;
 
+        // Parse bash history format: "  123  2025-11-06 15:06:39 command here"
+        // Skip leading spaces and line number
+        const char* cmd = line;
+
+        // Skip leading whitespace
+        while (*cmd == ' ' || *cmd == '\t') cmd++;
+
+        // Skip line number if present
+        if (*cmd >= '0' && *cmd <= '9') {
+            while (*cmd >= '0' && *cmd <= '9') cmd++;
+            while (*cmd == ' ' || *cmd == '\t') cmd++;
+        }
+
+        // Skip timestamp if present (format: YYYY-MM-DD HH:MM:SS)
+        // Look for date pattern: digits-digits-digits
+        if (*cmd >= '0' && *cmd <= '9') {
+            const char* check = cmd;
+            // Skip date: YYYY-MM-DD
+            while (*check && ((*check >= '0' && *check <= '9') || *check == '-')) check++;
+            // Skip space
+            if (*check == ' ') check++;
+            // Skip time: HH:MM:SS
+            while (*check && ((*check >= '0' && *check <= '9') || *check == ':')) check++;
+            // If we found a valid timestamp pattern, skip it
+            if (*check == ' ' && check > cmd + 10) {
+                cmd = check + 1;
+            }
+        }
+
+        // Skip any remaining whitespace
+        while (*cmd == ' ' || *cmd == '\t') cmd++;
+
+        // Skip if no actual command remains
+        if (strlen(cmd) == 0) continue;
+
         // Store in history
-        strncpy(terminal.history[terminal.history_count], line, MAX_LINE_LENGTH - 1);
+        strncpy(terminal.history[terminal.history_count], cmd, MAX_LINE_LENGTH - 1);
         terminal.history[terminal.history_count][MAX_LINE_LENGTH - 1] = '\0';
         terminal.history_count++;
     }
@@ -243,12 +348,153 @@ void terminal_update_prompt() {
 }
 
 // Start interactive shell in PTY
+// Columns that fit in a pane, and therefore the width advertised to the child
+// via TIOCSWINSZ. This is the single source of truth: the PTY, the ANSI
+// terminal's autowrap column and the renderer all have to agree on it. When
+// they did not, long lines wrapped in the child but not in the emulator and
+// ended up overwriting the start of their own row.
+static int terminal_cols_for_window(Window* win) {
+    if (!win || !win->font) return 80;
+
+    float char_w = GetAverageCharWidth(win->font, win->font_size.value);
+    if (char_w <= 0.0f) return 80;
+
+    float usable_w = win->size.width
+                   - win->text_margins.left
+                   - win->text_margins.right
+                   - win->border_size.size * 2.0f;
+
+    int cols = (int)(usable_w / char_w);
+
+    // Safety margin so glyphs never bleed past the 9-slice border.
+    if (cols > 6) cols -= 6;
+    if (cols < 20) cols = 20;
+    if (cols > ANSI_BUFFER_COLS) cols = ANSI_BUFFER_COLS;
+    return cols;
+}
+
+// Replace the calling (child) process with an interactive shell. bash is the
+// default environment; if it is not installed we fall over to sh so the
+// terminal still comes up on a minimal system. Only returns if both fail.
+static void exec_default_shell(void) {
+    // Ensure bash loads with full completion support.
+    setenv("BASH_COMPLETION_USER_FILE", "/etc/bash_completion", 1);
+
+    // -i so bash reads .bashrc and runs its line editor.
+    execlp("bash", "bash", "-i", (char*)NULL);
+
+    // stderr is the PTY slave here, so this lands in the terminal window and
+    // explains why the prompt that follows is sh rather than bash.
+    fprintf(stderr, "bash unavailable (%s), falling back to sh\r\n", strerror(errno));
+
+    execlp("sh", "sh", "-i", (char*)NULL);
+    fprintf(stderr, "sh unavailable (%s): no shell to run\r\n", strerror(errno));
+}
+
+// A pane narrower or shorter than this is not a terminal any more, it is a
+// sliver. These are the floors the window minimum is built from.
+#define MIN_PANE_COLS 24
+#define MIN_PANE_ROWS 10
+
+// Smallest pane width terminal_cols_for_window() still reports MIN_PANE_COLS
+// for. Measured against the real function instead of re-deriving the formula,
+// so it cannot drift from the layout the renderer actually uses.
+static uint32_t pane_width_for_cols(Window* win, int min_cols) {
+    if (!win) return 640;
+
+    WindowSize saved = win->size;
+    uint32_t result = 1024;   // fallback if nothing in range qualifies
+
+    for (uint32_t w = 64; w < 4096; w += 8) {
+        win->size = WINDOW_SIZE(w, saved.height);
+        if (terminal_cols_for_window(win) >= min_cols) {
+            result = w;
+            break;
+        }
+    }
+
+    win->size = saved;
+    return result;
+}
+
+// Height a pane needs for min_rows text rows. The vertical chrome is all
+// positive here, so unlike the width this one inverts cleanly.
+static uint32_t pane_height_for_rows(Window* win, int min_rows) {
+    if (!win) return 400;
+
+    float char_h = win->font_size.value * 16.0f * (1.0f + win->line_spacing.value);
+    if (char_h < 1.0f) char_h = 1.0f;
+
+    float chrome = (float)win->text_margins.top + (float)win->text_margins.bottom
+                 + win->border_size.size * 2.0f;
+
+    // The renderer reserves 0.75 of a line above the first row and drops one
+    // row so descenders are not clipped.
+    return (uint32_t)((min_rows + 1.75f) * char_h + chrome) + 1;
+}
+
+// Constrain the window so no pane can be squeezed into uselessness. The
+// minimum depends on the split mode - side by side needs twice the width,
+// stacked needs twice the height - and on the font size, so it is reapplied
+// whenever either changes.
+static void apply_window_size_limits(GLFWwindow* window) {
+    if (!window || !term_window || !term_window->font) return;
+
+    uint32_t pane_w = pane_width_for_cols(term_window, MIN_PANE_COLS);
+    uint32_t pane_h = pane_height_for_rows(term_window, MIN_PANE_ROWS);
+
+    int min_w = (int)pane_w + WINDOW_EDGE_PADDING * 2;
+    int min_h = (int)pane_h + WINDOW_EDGE_PADDING * 2;
+
+    if (split_horizontal) {
+        min_w = (int)(pane_w * 2) + TERMINAL_GAP + WINDOW_EDGE_PADDING * 2;
+    } else if (split_vertical) {
+        min_h = (int)(pane_h * 2) + TERMINAL_GAP + WINDOW_EDGE_PADDING * 2;
+    }
+
+    glfwSetWindowSizeLimits(window, min_w, min_h, GLFW_DONT_CARE, GLFW_DONT_CARE);
+
+    // Raising the limit does not resize a window that is already smaller, so
+    // grow it here. Without this, splitting inside a small window produces
+    // exactly the collapsed pane the limit exists to prevent.
+    int cur_w = 0, cur_h = 0;
+    glfwGetWindowSize(window, &cur_w, &cur_h);
+    if (cur_w < min_w || cur_h < min_h) {
+        glfwSetWindowSize(window,
+                          cur_w < min_w ? min_w : cur_w,
+                          cur_h < min_h ? min_h : cur_h);
+    }
+}
+
 void start_interactive_shell(const char* cmd) {
     if (pty_master_fd != -1) return; // already running
 
+    // Calculate actual window size to avoid initial resize shock
+    int rows = 24, cols = 80;  // Safe defaults
+    if (term_window && term_window->font) {
+        float char_h = term_window->font_size.value * 16.0f * (1.0f + term_window->line_spacing.value);
+        float border_padding = term_window->border_size.size * 2.0f;
+        float usable_h = term_window->size.height - term_window->text_margins.top -
+                        term_window->text_margins.bottom - border_padding;
+
+        // Account for vertical padding for first line (matches rendering)
+        float vertical_padding = char_h * 0.75f;
+        usable_h -= vertical_padding;
+
+        cols = terminal_cols_for_window(term_window);
+        rows = (int)(usable_h / char_h);
+
+        if (rows > 3) rows -= 3;  // Match PTY resize: 2 for safety + 1 for descender clipping
+        if (rows < 10) rows = 10;
+        if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+    }
+
+    // The ANSI terminal must autowrap at exactly the width the child is given.
+    ansi_set_size(&ansi_term, cols, rows);
+
     struct winsize ws = {
-        .ws_row = ANSI_BUFFER_ROWS,
-        .ws_col = ANSI_BUFFER_COLS,
+        .ws_row = rows,
+        .ws_col = cols,
         .ws_xpixel = 0,
         .ws_ypixel = 0
     };
@@ -272,34 +518,41 @@ void start_interactive_shell(const char* cmd) {
             close(fd);
         }
 
-        // Set terminal type - use xterm for better SSH compatibility
-        setenv("TERM", "xterm", 1);
+        // Set terminal type - use xterm-256color for full feature support
+        setenv("TERM", "xterm-256color", 1);
 
         // Suppress terminal capability warnings during bash startup
         setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);
 
-        // Configure terminal attributes for proper SSH operation
+        // Ensure readline uses proper completion settings
+        setenv("INPUTRC", "/etc/inputrc", 0);  // Use system default if not set
+
+        // Configure terminal attributes for proper interactive shell operation
         struct termios tios;
         if (tcgetattr(STDIN_FILENO, &tios) == 0) {
-            // Enable canonical mode and echo for interactive programs
-            tios.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ISIG;
-            // Enable output processing
+            // Disable canonical mode so bash can use its own line editing (readline)
+            tios.c_lflag &= ~ICANON;
+            // Enable echo, backspace erase, and signal generation
+            tios.c_lflag |= ECHO | ECHOE | ECHOK | ISIG;
+            // Enable output processing (OPOST) and newline conversion (ONLCR)
             tios.c_oflag |= OPOST | ONLCR;
-            // Set input flags
+            // Set input flags: CR to NL conversion, enable flow control
             tios.c_iflag |= ICRNL | IXON;
+            // Set erase character to backspace/DEL (0x7f)
+            tios.c_cc[VERASE] = 0x7f;
+            // Set minimum chars and timeout for non-canonical mode
+            tios.c_cc[VMIN] = 1;
+            tios.c_cc[VTIME] = 0;
             tcsetattr(STDIN_FILENO, TCSANOW, &tios);
         }
 
         if (cmd && *cmd) {
             execlp("sh", "sh", "-c", cmd, (char*)NULL);
+            perror("execlp sh -c");
         } else {
-            // Use -i (interactive) instead of --login to avoid terminal setting warnings
-            // The PTY provides a proper terminal environment
-            execlp("bash", "bash", "-i", (char*)NULL);
+            exec_default_shell();
         }
 
-        // If execlp fails
-        perror("execlp");
         _exit(1);
     }
 
@@ -324,12 +577,13 @@ void poll_pty() {
 
     char buf[4096];
     int read_count = 0;
-    const int max_reads = 100; // Prevent infinite loop
+    const int max_reads = 10; // Reduced to prevent UI freeze - process max 40KB per frame
     bool child_exited = false;
 
     for (;;) {
         if (read_count++ > max_reads) {
             // Safety: prevent getting stuck in read loop
+            // More data will be read in the next frame
             break;
         }
 
@@ -400,7 +654,7 @@ void poll_pty_right() {
 
     char buf[4096];
     int read_count = 0;
-    const int max_reads = 100;
+    const int max_reads = 10; // Reduced to prevent UI freeze - process max 40KB per frame
     bool child_exited = false;
 
     for (;;) {
@@ -468,7 +722,7 @@ void poll_pty_bottom() {
 
     char buf[4096];
     int read_count = 0;
-    const int max_reads = 100;
+    const int max_reads = 10; // Reduced to prevent UI freeze - process max 40KB per frame
     bool child_exited = false;
 
     for (;;) {
@@ -567,11 +821,12 @@ void send_key_to_pty(int key) {
         case GLFW_KEY_RIGHT: seq = "\x1b[C"; break;
         case GLFW_KEY_LEFT:  seq = "\x1b[D"; break;
 
-        // Home/End/Page keys
+        // Home/End/Page/Delete keys
         case GLFW_KEY_HOME:      seq = "\x1b[H"; break;
         case GLFW_KEY_END:       seq = "\x1b[F"; break;
         case GLFW_KEY_PAGE_UP:   seq = "\x1b[5~"; break;
         case GLFW_KEY_PAGE_DOWN: seq = "\x1b[6~"; break;
+        case GLFW_KEY_DELETE:    seq = "\x1b[3~"; break;
     }
 
     if (seq) {
@@ -587,15 +842,10 @@ void resize_pty_to_window() {
     if (pty_master_fd < 0 || !term_window || !term_window->font) return;
 
     // Get actual character dimensions from font metrics
-    float char_w = GetAverageCharWidth(term_window->font, term_window->font_size.value);
     float char_h = term_window->font_size.value * 16.0f * (1.0f + term_window->line_spacing.value);
 
     // Text content area inside window (respect margins + border padding)
     float border_padding = term_window->border_size.size * 2.0f;
-    float usable_w = term_window->size.width
-                   - term_window->text_margins.left
-                   - term_window->text_margins.right
-                   - border_padding;
     float usable_h = term_window->size.height
                    - term_window->text_margins.top
                    - term_window->text_margins.bottom
@@ -605,21 +855,19 @@ void resize_pty_to_window() {
     float vertical_padding = char_h * 0.75f;
     usable_h -= vertical_padding;
 
-    int cols = (int)(usable_w / char_w);
+    int cols = terminal_cols_for_window(term_window);
     int rows = (int)(usable_h / char_h);
 
-    // Subtract 6 columns for safety margin (matches rendering calculation)
-    if (cols > 6) cols -= 6;
+    // Subtract 3 rows total: 2 for safety + 1 to match rendering descender clipping
+    if (rows > 3) rows -= 3;
 
-    // Subtract 2 rows for safety margin to prevent text going below visible area
-    if (rows > 2) rows -= 2;
-
-    if (cols < 20) cols = 20;
     if (rows < 10) rows = 10;  // Ensure minimum rows for programs like top
 
     // Don't advertise more than we can store in ansi_term
-    if (cols > ANSI_BUFFER_COLS) cols = ANSI_BUFFER_COLS;
     if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+
+    // Keep the emulator's autowrap column in step with what the child is told.
+    ansi_set_size(&ansi_term, cols, rows);
 
     struct winsize ws = {
         .ws_row = rows,
@@ -628,9 +876,8 @@ void resize_pty_to_window() {
         .ws_ypixel = 0
     };
 
-    printf("PTY size: %d rows × %d cols (usable: %.0f×%.0f, char: %.1f×%.1f)\n",
-           rows, cols, usable_w, usable_h, char_w, char_h);
-    fflush(stdout);
+    DEBUG_PRINT("Left PTY size: %d rows x %d cols (usable height: %.0f, char height: %.1f)\n",
+                rows, cols, usable_h, char_h);
 
     // Check if pty_master_fd is a valid terminal before ioctl
     if (isatty(pty_master_fd)) {
@@ -649,15 +896,10 @@ void resize_pty_to_window_right() {
     if (pty_master_fd_right < 0 || !term_window_right || !term_window_right->font) return;
 
     // Get actual character dimensions from font metrics
-    float char_w = GetAverageCharWidth(term_window_right->font, term_window_right->font_size.value);
     float char_h = term_window_right->font_size.value * 16.0f * (1.0f + term_window_right->line_spacing.value);
 
     // Text content area inside window (respect margins + border padding)
     float border_padding = term_window_right->border_size.size * 2.0f;
-    float usable_w = term_window_right->size.width
-                   - term_window_right->text_margins.left
-                   - term_window_right->text_margins.right
-                   - border_padding;
     float usable_h = term_window_right->size.height
                    - term_window_right->text_margins.top
                    - term_window_right->text_margins.bottom
@@ -667,21 +909,19 @@ void resize_pty_to_window_right() {
     float vertical_padding = char_h * 0.75f;
     usable_h -= vertical_padding;
 
-    int cols = (int)(usable_w / char_w);
+    int cols = terminal_cols_for_window(term_window_right);
     int rows = (int)(usable_h / char_h);
 
-    // Subtract 3 columns for safety margin (matches rendering calculation)
-    if (cols > 3) cols -= 3;
+    // Subtract 3 rows total: 2 for safety + 1 to match rendering descender clipping
+    if (rows > 3) rows -= 3;
 
-    // Subtract 2 rows for safety margin to prevent text going below visible area
-    if (rows > 2) rows -= 2;
-
-    if (cols < 20) cols = 20;
     if (rows < 10) rows = 10;  // Ensure minimum rows for programs like top
 
     // Don't advertise more than we can store in ansi_term
-    if (cols > ANSI_BUFFER_COLS) cols = ANSI_BUFFER_COLS;
     if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+
+    // Keep the emulator's autowrap column in step with what the child is told.
+    ansi_set_size(&ansi_term_right, cols, rows);
 
     struct winsize ws = {
         .ws_row = rows,
@@ -690,9 +930,8 @@ void resize_pty_to_window_right() {
         .ws_ypixel = 0
     };
 
-    printf("Right PTY size: %d rows × %d cols (usable: %.0f×%.0f, char: %.1f×%.1f)\n",
-           rows, cols, usable_w, usable_h, char_w, char_h);
-    fflush(stdout);
+    DEBUG_PRINT("Right PTY size: %d rows x %d cols (usable height: %.0f, char height: %.1f)\n",
+                rows, cols, usable_h, char_h);
 
     // Check if pty_master_fd_right is a valid terminal before ioctl
     if (isatty(pty_master_fd_right)) {
@@ -711,15 +950,10 @@ void resize_pty_to_window_bottom() {
     if (pty_master_fd_bottom < 0 || !term_window_bottom || !term_window_bottom->font) return;
 
     // Get actual character dimensions from font metrics
-    float char_w = GetAverageCharWidth(term_window_bottom->font, term_window_bottom->font_size.value);
     float char_h = term_window_bottom->font_size.value * 16.0f * (1.0f + term_window_bottom->line_spacing.value);
 
     // Text content area inside window (respect margins + border padding)
     float border_padding = term_window_bottom->border_size.size * 2.0f;
-    float usable_w = term_window_bottom->size.width
-                   - term_window_bottom->text_margins.left
-                   - term_window_bottom->text_margins.right
-                   - border_padding;
     float usable_h = term_window_bottom->size.height
                    - term_window_bottom->text_margins.top
                    - term_window_bottom->text_margins.bottom
@@ -729,21 +963,19 @@ void resize_pty_to_window_bottom() {
     float vertical_padding = char_h * 0.75f;
     usable_h -= vertical_padding;
 
-    int cols = (int)(usable_w / char_w);
+    int cols = terminal_cols_for_window(term_window_bottom);
     int rows = (int)(usable_h / char_h);
 
-    // Subtract 3 columns for safety margin (matches rendering calculation)
-    if (cols > 3) cols -= 3;
+    // Subtract 3 rows total: 2 for safety + 1 to match rendering descender clipping
+    if (rows > 3) rows -= 3;
 
-    // Subtract 2 rows for safety margin to prevent text going below visible area
-    if (rows > 2) rows -= 2;
-
-    if (cols < 20) cols = 20;
     if (rows < 10) rows = 10;  // Ensure minimum rows for programs like top
 
     // Don't advertise more than we can store in ansi_term
-    if (cols > ANSI_BUFFER_COLS) cols = ANSI_BUFFER_COLS;
     if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+
+    // Keep the emulator's autowrap column in step with what the child is told.
+    ansi_set_size(&ansi_term_bottom, cols, rows);
 
     struct winsize ws = {
         .ws_row = rows,
@@ -752,9 +984,8 @@ void resize_pty_to_window_bottom() {
         .ws_ypixel = 0
     };
 
-    printf("Bottom PTY size: %d rows × %d cols (usable: %.0f×%.0f, char: %.1f×%.1f)\n",
-           rows, cols, usable_w, usable_h, char_w, char_h);
-    fflush(stdout);
+    DEBUG_PRINT("Bottom PTY size: %d rows x %d cols (usable height: %.0f, char height: %.1f)\n",
+                rows, cols, usable_h, char_h);
 
     // Check if pty_master_fd_bottom is a valid terminal before ioctl
     if (isatty(pty_master_fd_bottom)) {
@@ -789,7 +1020,7 @@ void terminal_init() {
 
     // Add welcome message
     terminal_add_line("Terminal Emulator v1.0");
-    terminal_add_line("Type 'help' or 'shell' for interactive shell");
+    terminal_add_line("Type 'shell' to start a shell, 'help' for commands");
     terminal_add_line("Press Ctrl+Q to exit");
     terminal_add_line("========================================");
 }
@@ -825,29 +1056,32 @@ void strip_ansi_codes(char* dest, const char* src, size_t max_len) {
 }
 
 // Calculate how many characters fit in one line based on window width
+// OPTIMIZATION: Now uses cache to avoid repeated calculation
 int calculate_line_width() {
+    // Return cached value if available
+    if (cached_line_width != -1) {
+        return cached_line_width;
+    }
+
     if (!term_window || !term_window->font) return 80;  // Default
 
-    // Calculate available width - must match rendering boundaries exactly
-    float border_padding = term_window->border_size.size * 2.0f;  // 8px on each side = 16px total
-    float available_width = term_window->size.width -
-                           term_window->text_margins.left -
-                           term_window->text_margins.right -
-                           border_padding;  // No extra margin - match rendering exactly
+    // Same width the renderer will draw at. Wrapping wider than that silently
+    // truncated the overflow at render time.
+    int chars_per_line = terminal_cols_for_window(term_window);
 
-    // Get actual character width from font metrics
-    float char_width = GetAverageCharWidth(term_window->font, term_window->font_size.value);
+    // CRITICAL: Prevent buffer overflow - never exceed MAX_LINE_LENGTH
+    if (chars_per_line >= MAX_LINE_LENGTH - 1) {
+        chars_per_line = MAX_LINE_LENGTH - 2;
+    }
 
-    int chars_per_line = (int)(available_width / char_width);
-
-    // Leave two columns visually empty for extra padding to prevent border overflow
-    if (chars_per_line > 2) chars_per_line -= 2;
-
-    // Ensure minimum width but respect actual space
-    if (chars_per_line < 20) chars_per_line = 20;  // Minimum readable width
-    if (available_width < 100) chars_per_line = 10;  // Very narrow window fallback
-
+    // Cache the result
+    cached_line_width = chars_per_line;
     return chars_per_line;
+}
+
+// Invalidate cached line width (call on resize, font size change, etc.)
+void invalidate_line_width_cache() {
+    cached_line_width = -1;
 }
 
 // Word wrap a single raw line into multiple display lines
@@ -878,6 +1112,11 @@ void wrap_line(const char* raw_line, char wrapped_lines[][MAX_LINE_LENGTH], int*
             chars_to_copy = line_len - pos;
         }
 
+        // CRITICAL: Defensive clamp to prevent buffer overflow
+        if (chars_to_copy >= MAX_LINE_LENGTH) {
+            chars_to_copy = MAX_LINE_LENGTH - 1;
+        }
+
         // Copy the line segment
         strncpy(wrapped_lines[*wrapped_count], &raw_line[pos], chars_to_copy);
         wrapped_lines[*wrapped_count][chars_to_copy] = '\0';
@@ -895,8 +1134,16 @@ void wrap_line(const char* raw_line, char wrapped_lines[][MAX_LINE_LENGTH], int*
 }
 
 // Rewrap all terminal content to fit current window width
+// NOTE: This is expensive (O(N) where N = raw_line_count). Only call on:
+// - Window resize
+// - Font size change
+// - Buffer overflow requiring scroll
+// Normal line additions use incremental wrapping in terminal_add_line()
 void rewrap_terminal_content() {
     if (!term_window) return;
+
+    // Invalidate cache since window properties may have changed
+    invalidate_line_width_cache();
 
     int max_width = calculate_line_width();
 
@@ -919,13 +1166,27 @@ void rewrap_terminal_content() {
 }
 
 // Add a line to terminal output
+// OPTIMIZATION: Incremental wrapping - only wraps new line, not all lines
+// Drop the oldest `count` display lines to make room at the end.
+static void terminal_drop_oldest_lines(int count) {
+    if (count <= 0) return;
+    if (count >= terminal.line_count) {
+        terminal.line_count = 0;
+    } else {
+        memmove(terminal.lines[0], terminal.lines[count],
+                (size_t)(terminal.line_count - count) * MAX_LINE_LENGTH);
+        terminal.line_count -= count;
+    }
+    terminal.scroll_offset -= count;
+    if (terminal.scroll_offset < 0) terminal.scroll_offset = 0;
+}
+
 void terminal_add_line(const char* text) {
-    // Add to raw lines
+    // Scrollback is full: drop the oldest raw line to make room. This used to
+    // return early, which threw away every line after the buffer filled up.
     if (terminal.raw_line_count >= MAX_TERMINAL_LINES) {
-        // Shift raw lines up
-        for (int i = 0; i < MAX_TERMINAL_LINES - 1; i++) {
-            strcpy(terminal.raw_lines[i], terminal.raw_lines[i + 1]);
-        }
+        memmove(terminal.raw_lines[0], terminal.raw_lines[1],
+                (size_t)(MAX_TERMINAL_LINES - 1) * MAX_LINE_LENGTH);
         terminal.raw_line_count = MAX_TERMINAL_LINES - 1;
     }
 
@@ -937,8 +1198,39 @@ void terminal_add_line(const char* text) {
     terminal.raw_lines[terminal.raw_line_count][MAX_LINE_LENGTH - 1] = '\0';
     terminal.raw_line_count++;
 
-    // Rewrap everything to update display
-    rewrap_terminal_content();
+    // OPTIMIZATION: Only wrap the newly added line instead of rewrapping everything
+    int max_width = calculate_line_width();
+
+    char temp_wrapped[10][MAX_LINE_LENGTH];
+    int wrapped_count = 0;
+    wrap_line(terminal.raw_lines[terminal.raw_line_count - 1], temp_wrapped, &wrapped_count, 10, max_width);
+
+    // Make room at the end rather than dropping the new content.
+    if (terminal.line_count + wrapped_count > MAX_TERMINAL_LINES) {
+        terminal_drop_oldest_lines(terminal.line_count + wrapped_count - MAX_TERMINAL_LINES);
+    }
+
+    for (int j = 0; j < wrapped_count && terminal.line_count < MAX_TERMINAL_LINES; j++) {
+        strcpy(terminal.lines[terminal.line_count], temp_wrapped[j]);
+        terminal.line_count++;
+    }
+
+    // Auto-scroll to bottom to show new content
+    // Calculate how many lines can fit in the visible area
+    if (term_window && term_window->font) {
+        float line_height = term_window->font_size.value * 16.0f * (1.0f + term_window->line_spacing.value);
+        float border_padding = term_window->border_size.size;
+        float content_height = term_window->size.height - term_window->text_margins.top -
+                              term_window->text_margins.bottom - (border_padding * 2);
+        float available_height = content_height - line_height; // Reserve 1 line for input prompt
+        int max_visible_lines = (int)(available_height / line_height);
+        if (max_visible_lines < 1) max_visible_lines = 1;
+
+        // Set scroll to show the most recent lines
+        int max_scroll = terminal.line_count - max_visible_lines + 1;
+        if (max_scroll < 0) max_scroll = 0;
+        terminal.scroll_offset = max_scroll;
+    }
 }
 
 // Execute terminal command
@@ -951,6 +1243,32 @@ void terminal_execute_command(const char* cmd) {
     if (strlen(cmd) == 0) {
         terminal_update_prompt();  // Update prompt even for empty commands
         return;
+    }
+
+    // Add command to history array (skip empty commands and duplicates)
+    if (strlen(cmd) > 0) {
+        // Check if this is a duplicate of the last command
+        bool is_duplicate = false;
+        if (terminal.history_count > 0) {
+            if (strcmp(terminal.history[terminal.history_count - 1], cmd) == 0) {
+                is_duplicate = true;
+            }
+        }
+
+        if (!is_duplicate) {
+            // Add to history
+            if (terminal.history_count >= MAX_TERMINAL_LINES) {
+                // Shift history up to make room
+                for (int i = 0; i < MAX_TERMINAL_LINES - 1; i++) {
+                    strcpy(terminal.history[i], terminal.history[i + 1]);
+                }
+                terminal.history_count = MAX_TERMINAL_LINES - 1;
+            }
+
+            strncpy(terminal.history[terminal.history_count], cmd, MAX_LINE_LENGTH - 1);
+            terminal.history[terminal.history_count][MAX_LINE_LENGTH - 1] = '\0';
+            terminal.history_count++;
+        }
     }
 
     // Handle built-in commands
@@ -1105,8 +1423,85 @@ void terminal_execute_command(const char* cmd) {
 }
 
 // Tab completion function
+// Rebuild the line up to the point the completion is appended: everything
+// before the word being completed, plus that word's directory part if it has
+// one. Both completion branches need exactly this, and both used to build it
+// inline with unbounded strncat calls.
+static void tab_build_line_head(char* out, size_t out_size, const char* buffer,
+                                int word_offset, const char* word_start, bool is_path) {
+    size_t head = (size_t)word_offset;
+    if (head >= out_size) head = out_size - 1;
+    memcpy(out, buffer, head);
+    out[head] = '\0';
+
+    if (!is_path) return;
+
+    const char* last_slash = strrchr(word_start, '/');
+    if (!last_slash) return;
+
+    size_t dir_len = (size_t)(last_slash - word_start) + 1;   // keep the slash
+    size_t room = out_size - strlen(out) - 1;
+    if (dir_len > room) dir_len = room;
+    strncat(out, word_start, dir_len);
+}
+
 void handle_tab_completion() {
-    if (terminal.cursor_pos == 0) return;
+    double current_time = glfwGetTime();
+    bool is_double_tab = (current_time - last_tab_time) < 0.5;
+    last_tab_time = current_time;
+
+    // Special case: double-tab on empty input or after directory - list current directory
+    if (terminal.cursor_pos == 0 ||
+        (is_double_tab && strlen(terminal.input_buffer) > 0 &&
+         terminal.input_buffer[terminal.cursor_pos - 1] == '/')) {
+
+        // List current directory or the directory that was just completed
+        const char* list_dir = ".";
+        if (is_double_tab && strlen(last_completed_path) > 0) {
+            list_dir = last_completed_path;
+        }
+
+        DIR* dir = opendir(list_dir);
+        if (dir) {
+            terminal_add_line("");
+            terminal_add_line("Contents:");
+
+            struct dirent* entry;
+            char line[MAX_LINE_LENGTH] = "";
+            int count = 0;
+
+            while ((entry = readdir(dir)) != NULL) {
+                if (entry->d_name[0] == '.') continue;  // Skip hidden files
+
+                // Add directory indicator
+                struct stat st;
+                // list_dir may be last_completed_path (2 * MAX_LINE_LENGTH),
+                // plus a separator and a directory entry name.
+                char full_path[MAX_LINE_LENGTH * 4];
+                snprintf(full_path, sizeof(full_path), "%s/%s", list_dir, entry->d_name);
+                bool is_dir = (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode));
+
+                char item[32];
+                snprintf(item, sizeof(item), "%-25.25s%s", entry->d_name, is_dir ? "/" : " ");
+
+                if (count % 3 == 0) {
+                    if (count > 0) terminal_add_line(line);
+                    snprintf(line, sizeof(line), "  %s", item);
+                } else {
+                    strncat(line, item, sizeof(line) - strlen(line) - 1);
+                }
+                count++;
+            }
+            if (count > 0) terminal_add_line(line);
+            closedir(dir);
+
+            // Re-display prompt
+            char echo_line[MAX_LINE_LENGTH * 2];
+            snprintf(echo_line, sizeof(echo_line), "%s%s", terminal.prompt, terminal.input_buffer);
+            terminal_add_line(echo_line);
+        }
+        return;
+    }
 
     char input[MAX_LINE_LENGTH];
     strncpy(input, terminal.input_buffer, sizeof(input) - 1);
@@ -1128,14 +1523,18 @@ void handle_tab_completion() {
         // Split into directory and prefix
         char temp[MAX_LINE_LENGTH];
         strncpy(temp, word_start, sizeof(temp) - 1);
+        temp[sizeof(temp) - 1] = '\0';  // Ensure NUL termination
         char* last_slash = strrchr(temp, '/');
         if (last_slash) {
             *last_slash = '\0';
             strncpy(dir_path, temp[0] ? temp : "/", sizeof(dir_path) - 1);
+            dir_path[sizeof(dir_path) - 1] = '\0';  // Ensure NUL termination
             strncpy(prefix, last_slash + 1, sizeof(prefix) - 1);
+            prefix[sizeof(prefix) - 1] = '\0';  // Ensure NUL termination
         }
     } else {
         strncpy(prefix, word_start, sizeof(prefix) - 1);
+        prefix[sizeof(prefix) - 1] = '\0';  // Ensure NUL termination
     }
 
     // Find matching files/directories
@@ -1151,6 +1550,7 @@ void handle_tab_completion() {
 
         if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
             strncpy(matches[match_count], entry->d_name, MAX_LINE_LENGTH - 1);
+            matches[match_count][MAX_LINE_LENGTH - 1] = '\0';  // Ensure NUL termination
 
             // Add / for directories
             struct stat st;
@@ -1169,37 +1569,50 @@ void handle_tab_completion() {
     } else if (match_count == 1) {
         // Single match - complete it
         char new_input[MAX_LINE_LENGTH];
-        strncpy(new_input, terminal.input_buffer, word_offset);
-        new_input[word_offset] = '\0';
+        tab_build_line_head(new_input, sizeof(new_input), terminal.input_buffer,
+                            word_offset, word_start, is_path);
 
-        if (is_path) {
-            // Keep the directory path
-            char* last_slash = strrchr(word_start, '/');
-            if (last_slash) {
-                strncat(new_input, word_start, (last_slash - word_start) + 1);
+        strncat(new_input, matches[0], sizeof(new_input) - strlen(new_input) - 1);
+
+        // Store completed path if it's a directory (for double-tab listing)
+        if (matches[0][strlen(matches[0]) - 1] == '/') {
+            // Build full path for directory
+            if (is_path) {
+                snprintf(last_completed_path, sizeof(last_completed_path), "%s/%s", dir_path, matches[0]);
+            } else {
+                snprintf(last_completed_path, sizeof(last_completed_path), "./%s", matches[0]);
             }
+            // Remove trailing slash for opendir
+            size_t len = strlen(last_completed_path);
+            if (len > 0 && last_completed_path[len - 1] == '/') {
+                last_completed_path[len - 1] = '\0';
+            }
+        } else {
+            last_completed_path[0] = '\0';
         }
 
-        strncat(new_input, matches[0], MAX_LINE_LENGTH - strlen(new_input) - 1);
-
         strncpy(terminal.input_buffer, new_input, MAX_LINE_LENGTH - 1);
+        terminal.input_buffer[MAX_LINE_LENGTH - 1] = '\0';  // Ensure NUL termination
         terminal.cursor_pos = strlen(terminal.input_buffer);
+        strncpy(last_tab_completion, terminal.input_buffer, sizeof(last_tab_completion) - 1);
+        last_tab_completion[sizeof(last_tab_completion) - 1] = '\0';  // Ensure NUL termination
 
         // Echo completion with prompt
         char echo_line[MAX_LINE_LENGTH * 2];
         snprintf(echo_line, sizeof(echo_line), "%s%s", terminal.prompt, terminal.input_buffer);
         terminal_add_line(echo_line);
     } else {
-        // Multiple matches - show them
+        // Multiple matches
+        // Show all matches on first tab or double-tab
         terminal_add_line("");
         char line[MAX_LINE_LENGTH];
         for (int i = 0; i < match_count; i++) {
             if (i % 3 == 0) {
                 if (i > 0) terminal_add_line(line);
-                snprintf(line, sizeof(line), "  %-25s", matches[i]);
+                snprintf(line, sizeof(line), "  %-25.25s", matches[i]);
             } else {
                 char temp[30];
-                snprintf(temp, sizeof(temp), "%-25s", matches[i]);
+                snprintf(temp, sizeof(temp), "%-25.25s", matches[i]);
                 strncat(line, temp, MAX_LINE_LENGTH - strlen(line) - 1);
             }
         }
@@ -1222,22 +1635,31 @@ void handle_tab_completion() {
         // Complete to common prefix
         if (common_len > (int)strlen(prefix)) {
             char new_input[MAX_LINE_LENGTH];
-            strncpy(new_input, terminal.input_buffer, word_offset);
-            new_input[word_offset] = '\0';
+            tab_build_line_head(new_input, sizeof(new_input), terminal.input_buffer,
+                                word_offset, word_start, is_path);
 
-            if (is_path) {
-                char* last_slash = strrchr(word_start, '/');
-                if (last_slash) {
-                    strncat(new_input, word_start, (last_slash - word_start) + 1);
-                }
-            }
-
-            strncat(new_input, matches[0], common_len);
-            new_input[word_offset + common_len] = '\0';
+            // Append only the common prefix. There used to be an explicit
+            // NUL at new_input[word_offset + common_len] here, which ignored
+            // the directory part appended above: for a path completion it
+            // truncated the line straight back to the directory, deleting
+            // what had been typed instead of extending it.
+            size_t room = sizeof(new_input) - strlen(new_input) - 1;
+            size_t take = (size_t)common_len < room ? (size_t)common_len : room;
+            strncat(new_input, matches[0], take);
 
             strncpy(terminal.input_buffer, new_input, MAX_LINE_LENGTH - 1);
+            terminal.input_buffer[MAX_LINE_LENGTH - 1] = '\0';  // Ensure NUL termination
             terminal.cursor_pos = strlen(terminal.input_buffer);
         }
+
+        // Store last completion state
+        strncpy(last_tab_completion, terminal.input_buffer, sizeof(last_tab_completion) - 1);
+        last_tab_completion[sizeof(last_tab_completion) - 1] = '\0';  // Ensure NUL termination
+
+        // Re-display prompt
+        char echo_line[MAX_LINE_LENGTH * 2];
+        snprintf(echo_line, sizeof(echo_line), "%s%s", terminal.prompt, terminal.input_buffer);
+        terminal_add_line(echo_line);
     }
 }
 
@@ -1246,6 +1668,12 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     (void)scancode;
 
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+
+    // Enter blip. Only on the initial press - holding Enter down repeats the
+    // key, and retriggering the clip on every repeat would machine-gun it.
+    if (action == GLFW_PRESS && (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER)) {
+        sound_play();
+    }
 
     // Context menu text positioning with arrow keys
     if (context_menu.visible) {
@@ -1281,8 +1709,9 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         }
         if (key == GLFW_KEY_U) {
             // Ctrl+U: Clear line (delete from cursor to beginning)
-            if (terminal.cursor_pos > 0) {
-                int remaining = strlen(terminal.input_buffer) - terminal.cursor_pos;
+            int len = strlen(terminal.input_buffer);
+            if (terminal.cursor_pos > 0 && terminal.cursor_pos <= len) {
+                int remaining = len - terminal.cursor_pos;
                 memmove(terminal.input_buffer, terminal.input_buffer + terminal.cursor_pos, remaining + 1);
                 terminal.cursor_pos = 0;
             }
@@ -1290,12 +1719,16 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         }
         if (key == GLFW_KEY_K) {
             // Ctrl+K: Kill line (delete from cursor to end)
-            terminal.input_buffer[terminal.cursor_pos] = '\0';
+            int len = strlen(terminal.input_buffer);
+            if (terminal.cursor_pos >= 0 && terminal.cursor_pos <= len) {
+                terminal.input_buffer[terminal.cursor_pos] = '\0';
+            }
             return;
         }
         if (key == GLFW_KEY_W) {
             // Ctrl+W: Delete word backwards
-            if (terminal.cursor_pos > 0) {
+            int len = strlen(terminal.input_buffer);
+            if (terminal.cursor_pos > 0 && terminal.cursor_pos <= len) {
                 int start = terminal.cursor_pos;
                 // Skip trailing spaces
                 while (start > 0 && terminal.input_buffer[start - 1] == ' ') {
@@ -1305,7 +1738,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
                 while (start > 0 && terminal.input_buffer[start - 1] != ' ') {
                     start--;
                 }
-                int remaining = strlen(terminal.input_buffer) - terminal.cursor_pos;
+                int remaining = len - terminal.cursor_pos;
                 memmove(terminal.input_buffer + start, terminal.input_buffer + terminal.cursor_pos, remaining + 1);
                 terminal.cursor_pos = start;
             }
@@ -1390,6 +1823,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         printf("Left margin: %d (text moved right)\n", (int)term_window->text_margins.left);
         fflush(stdout);
         resize_pty_to_window();
+        rewrap_terminal_content();  // Margin change affects line width
         return;
     }
     if (key == GLFW_KEY_F11) {
@@ -1397,6 +1831,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         printf("Left margin: %d (text moved left)\n", (int)term_window->text_margins.left);
         fflush(stdout);
         resize_pty_to_window();
+        rewrap_terminal_content();  // Margin change affects line width
         return;
     }
 
@@ -1486,11 +1921,12 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
                 case GLFW_KEY_RIGHT: seq = "\x1b[C"; break;
                 case GLFW_KEY_LEFT:  seq = "\x1b[D"; break;
 
-                // Home/End/Page keys
+                // Home/End/Page/Delete keys
                 case GLFW_KEY_HOME:      seq = "\x1b[H"; break;
                 case GLFW_KEY_END:       seq = "\x1b[F"; break;
                 case GLFW_KEY_PAGE_UP:   seq = "\x1b[5~"; break;
                 case GLFW_KEY_PAGE_DOWN: seq = "\x1b[6~"; break;
+                case GLFW_KEY_DELETE:    seq = "\x1b[3~"; break;
             }
 
             if (seq) {
@@ -1548,11 +1984,12 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
                 case GLFW_KEY_RIGHT: seq = "\x1b[C"; break;
                 case GLFW_KEY_LEFT:  seq = "\x1b[D"; break;
 
-                // Home/End/Page keys
+                // Home/End/Page/Delete keys
                 case GLFW_KEY_HOME:      seq = "\x1b[H"; break;
                 case GLFW_KEY_END:       seq = "\x1b[F"; break;
                 case GLFW_KEY_PAGE_UP:   seq = "\x1b[5~"; break;
                 case GLFW_KEY_PAGE_DOWN: seq = "\x1b[6~"; break;
+                case GLFW_KEY_DELETE:    seq = "\x1b[3~"; break;
             }
 
             if (seq) {
@@ -1610,9 +2047,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     }
 
     if (key == GLFW_KEY_BACKSPACE) {
-        if (terminal.cursor_pos > 0) {
+        int len = strlen(terminal.input_buffer);
+        // Ensure cursor position is valid
+        if (terminal.cursor_pos > 0 && terminal.cursor_pos <= len) {
             // Delete character before cursor
-            int len = strlen(terminal.input_buffer);
             memmove(terminal.input_buffer + terminal.cursor_pos - 1,
                    terminal.input_buffer + terminal.cursor_pos,
                    len - terminal.cursor_pos + 1);
@@ -1624,7 +2062,8 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     if (key == GLFW_KEY_DELETE) {
         // Delete character at cursor
         int len = strlen(terminal.input_buffer);
-        if (terminal.cursor_pos < len) {
+        // Ensure cursor position is valid
+        if (terminal.cursor_pos >= 0 && terminal.cursor_pos < len) {
             memmove(terminal.input_buffer + terminal.cursor_pos,
                    terminal.input_buffer + terminal.cursor_pos + 1,
                    len - terminal.cursor_pos);
@@ -1646,7 +2085,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 
     if (key == GLFW_KEY_UP) {
         // Navigate command history backwards
-        if (terminal.history_count == 0) return;
+        if (terminal.history_count == 0) {
+            printf("No command history available\n");
+            return;
+        }
 
         if (terminal.history_index == -1) {
             // First time pressing up - save current input
@@ -1661,6 +2103,9 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         strncpy(terminal.input_buffer, terminal.history[terminal.history_index], MAX_LINE_LENGTH - 1);
         terminal.input_buffer[MAX_LINE_LENGTH - 1] = '\0';
         terminal.cursor_pos = strlen(terminal.input_buffer);
+
+        // Visual feedback
+        printf("History [%d/%d]: %s\n", terminal.history_index + 1, terminal.history_count, terminal.input_buffer);
         return;
     }
 
@@ -1735,14 +2180,10 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
     // In split mode, route character input to focused terminal
     if (split_horizontal) {
         char utf8[4];
-        int len = 0;
+        int len = codepoint_to_utf8(codepoint, utf8);
 
-        // Only ASCII for now
-        if (codepoint < 128) {
-            utf8[0] = (char)codepoint;
-            len = 1;
-        } else {
-            return;
+        if (len == 0) {
+            return; // Invalid codepoint
         }
 
         if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
@@ -1769,14 +2210,10 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
         }
     } else if (split_vertical) {
         char utf8[4];
-        int len = 0;
+        int len = codepoint_to_utf8(codepoint, utf8);
 
-        // Only ASCII for now
-        if (codepoint < 128) {
-            utf8[0] = (char)codepoint;
-            len = 1;
-        } else {
-            return;
+        if (len == 0) {
+            return; // Invalid codepoint
         }
 
         if (focused_terminal == 0 && interactive_mode && pty_master_fd >= 0) {
@@ -1804,14 +2241,10 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
     } else if (interactive_mode && pty_master_fd >= 0) {
         // Single terminal mode
         char utf8[4];
-        int len = 0;
+        int len = codepoint_to_utf8(codepoint, utf8);
 
-        // Only ASCII for now
-        if (codepoint < 128) {
-            utf8[0] = (char)codepoint;
-            len = 1;
-        } else {
-            return;
+        if (len == 0) {
+            return; // Invalid codepoint
         }
 
         ssize_t result = write(pty_master_fd, utf8, len);
@@ -1827,23 +2260,188 @@ void char_callback(GLFWwindow* window, unsigned int codepoint) {
         return;
     }
 
-    // Insert character at cursor position
+    // Insert character at cursor position (non-interactive mode)
     int len = strlen(terminal.input_buffer);
-    if (len < MAX_LINE_LENGTH - 1) {
-        // Make room for new character by shifting everything after cursor right
-        memmove(terminal.input_buffer + terminal.cursor_pos + 1,
-               terminal.input_buffer + terminal.cursor_pos,
-               len - terminal.cursor_pos + 1);
-        // Insert character
-        terminal.input_buffer[terminal.cursor_pos] = (char)codepoint;
-        terminal.cursor_pos++;
-        terminal.history_index = -1;  // Reset history browsing when typing
+
+    // Bounds check: ensure we have room for new char + null terminator
+    // and cursor position is valid
+    if (len >= MAX_LINE_LENGTH - 1) {
+        // Buffer full - silently ignore (terminal behavior)
+        return;
     }
+
+    if (terminal.cursor_pos < 0 || terminal.cursor_pos > len) {
+        // Invalid cursor position - reset it
+        terminal.cursor_pos = len;
+    }
+
+    // Make room for new character by shifting everything after cursor right
+    // Safety: len < MAX_LINE_LENGTH - 1, so len + 1 < MAX_LINE_LENGTH (room for char + null)
+    memmove(terminal.input_buffer + terminal.cursor_pos + 1,
+           terminal.input_buffer + terminal.cursor_pos,
+           len - terminal.cursor_pos + 1);  // +1 to include null terminator
+
+    // Insert character (only ASCII printable for now)
+    terminal.input_buffer[terminal.cursor_pos] = (char)codepoint;
+    terminal.cursor_pos++;
+    terminal.history_index = -1;  // Reset history browsing when typing
+
+    // Ensure null termination (defensive)
+    terminal.input_buffer[len + 1] = '\0';
+}
+
+// xterm-style 16-colour ANSI palette, normalised to 0..1.
+// Indices 0-7 are the normal colours, 8-15 the bright ones. Blue is lifted off
+// the classic (0,0,238) because that is close to unreadable on a dark ground.
+static const float ansi_palette[ANSI_COLOR_COUNT][3] = {
+    {0.00f, 0.00f, 0.00f},  // 0  black
+    {0.80f, 0.00f, 0.00f},  // 1  red
+    {0.00f, 0.80f, 0.00f},  // 2  green
+    {0.80f, 0.80f, 0.00f},  // 3  yellow
+    {0.25f, 0.35f, 1.00f},  // 4  blue
+    {0.80f, 0.00f, 0.80f},  // 5  magenta
+    {0.00f, 0.80f, 0.80f},  // 6  cyan
+    {0.90f, 0.90f, 0.90f},  // 7  white (default foreground)
+    {0.50f, 0.50f, 0.50f},  // 8  bright black (grey)
+    {1.00f, 0.33f, 0.33f},  // 9  bright red
+    {0.33f, 1.00f, 0.33f},  // 10 bright green
+    {1.00f, 1.00f, 0.33f},  // 11 bright yellow
+    {0.45f, 0.60f, 1.00f},  // 12 bright blue
+    {1.00f, 0.33f, 1.00f},  // 13 bright magenta
+    {0.33f, 1.00f, 1.00f},  // 14 bright cyan
+    {1.00f, 1.00f, 1.00f},  // 15 bright white
+};
+
+// Look up an ANSI colour index. Bold promotes the normal colours to their
+// bright counterparts, which is what most terminals do.
+static void ansi_color_rgb(unsigned char index, bool bold, float* r, float* g, float* b) {
+    if (bold && index < 8) index += 8;
+    if (index >= ANSI_COLOR_COUNT) index = ANSI_DEFAULT_FG;
+    *r = ansi_palette[index][0];
+    *g = ansi_palette[index][1];
+    *b = ansi_palette[index][2];
+}
+
+// Render one pane's visible ANSI rows with per-cell colours.
+//
+// Each row is walked three times, grouping adjacent cells that share an
+// attribute into a single run so one glDrawArrays covers a whole colour span:
+//   1. background quads for runs whose bg is not the default,
+//   2. text runs sharing an (fg, bold) pair,
+//   3. underline rules beneath runs with the underline attribute.
+// Rows are laid out on the column grid (x0 + col * char_w) rather than by
+// accumulating glyph advances, so the backgrounds line up with the glyphs.
+static void render_ansi_pane(AnsiTerminal* term, Window* win, int start_row,
+                             int max_rows, int max_cols, float x0, float y0,
+                             float line_height) {
+    if (!term || !win || !win->font) return;
+
+    float font_size = win->font_size.value;
+    float char_w = GetAverageCharWidth(win->font, font_size);
+    float underline_h = font_size * 2.0f;
+    if (underline_h < 1.0f) underline_h = 1.0f;
+
+    if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+
+    AnsiCell cells[ANSI_BUFFER_COLS];
+    char run[ANSI_BUFFER_COLS + 1];
+    float y = y0;
+
+    for (int row = 0; row < max_rows; row++, y += line_height) {
+        int n = ansi_get_line_cells(term, start_row + row, cells, max_cols);
+        if (n <= 0) continue;
+
+        // The row occupies a full line_height band anchored on its text, so
+        // adjacent rows' backgrounds tile without gaps or overlap.
+        float row_top = y - line_height * 0.75f;
+
+        // Pass 1: background runs.
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBegin(GL_QUADS);
+        for (int i = 0; i < n; ) {
+            unsigned char bg = cells[i].bg_color;
+            int j = i;
+            while (j < n && cells[j].bg_color == bg) j++;
+
+            if (bg != ANSI_DEFAULT_BG) {
+                float r, g, b;
+                ansi_color_rgb(bg, false, &r, &g, &b);
+                glColor4f(r, g, b, 1.0f);
+                float left  = x0 + i * char_w;
+                float right = x0 + j * char_w;
+                glVertex2f(left,  row_top);
+                glVertex2f(right, row_top);
+                glVertex2f(right, row_top + line_height);
+                glVertex2f(left,  row_top + line_height);
+            }
+            i = j;
+        }
+        glEnd();
+
+        // Pass 2: text runs sharing a foreground colour and weight.
+        for (int i = 0; i < n; ) {
+            unsigned char fg = cells[i].fg_color;
+            bool bold = cells[i].bold;
+            int j = i;
+            while (j < n && cells[j].fg_color == fg && cells[j].bold == bold) j++;
+
+            int len = 0;
+            bool has_glyph = false;
+            for (int k = i; k < j; k++) {
+                run[len++] = cells[k].character;
+                if (cells[k].character != ' ') has_glyph = true;
+            }
+            run[len] = '\0';
+
+            if (has_glyph) {
+                float r, g, b;
+                ansi_color_rgb(fg, bold, &r, &g, &b);
+                RenderTextColored(win->font, run, x0 + i * char_w, y,
+                                  font_size, win->line_spacing.value, r, g, b, 1.0f);
+            }
+            i = j;
+        }
+
+        // Pass 3: underlines.
+        glDisable(GL_TEXTURE_2D);
+        glBegin(GL_QUADS);
+        for (int i = 0; i < n; ) {
+            unsigned char fg = cells[i].fg_color;
+            bool bold = cells[i].bold;
+            bool underline = cells[i].underline;
+            int j = i;
+            while (j < n && cells[j].underline == underline &&
+                   cells[j].fg_color == fg && cells[j].bold == bold) j++;
+
+            if (underline) {
+                float r, g, b;
+                ansi_color_rgb(fg, bold, &r, &g, &b);
+                glColor4f(r, g, b, 1.0f);
+                float left  = x0 + i * char_w;
+                float right = x0 + j * char_w;
+                float top   = y + font_size * 4.0f;
+                glVertex2f(left,  top);
+                glVertex2f(right, top);
+                glVertex2f(right, top + underline_h);
+                glVertex2f(left,  top + underline_h);
+            }
+            i = j;
+        }
+        glEnd();
+        glDisable(GL_BLEND);
+    }
+
+    // Leave the pipeline in the white/untextured state the rest of the
+    // renderer expects.
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 // Render terminal content
 void render_terminal_content() {
     if (!term_window || !term_window->font) return;
+
 
     ScreenCoord pos = wm_calculate_position(&wm, term_window);
 
@@ -1865,33 +2463,32 @@ void render_terminal_content() {
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
     // Enable scissor test to clip text to content area
+    // A pane squeezed past its chrome yields a negative rectangle, which
+    // glScissor rejects outright - leaving the previous pane's rectangle in
+    // force and clipping this one away entirely. Clamp instead so an
+    // over-small pane simply draws nothing.
+    int scissor_w = (int)(content_right - content_left);
+    int scissor_h = (int)(content_bottom - content_top);
+    if (scissor_w < 0) scissor_w = 0;
+    if (scissor_h < 0) scissor_h = 0;
+
     glEnable(GL_SCISSOR_TEST);
     glScissor(
         (int)content_left,
         (int)(wm.screen_size.height - content_bottom),  // OpenGL scissor is from bottom
-        (int)(content_right - content_left),
-        (int)(content_bottom - content_top)
+        scissor_w,
+        scissor_h
     );
 
     if (interactive_mode) {
-        // Calculate how many columns fit horizontally (must match PTY column calculation)
-        float border_padding_total = term_window->border_size.size * 2.0f;
-        float usable_w = term_window->size.width -
-                        term_window->text_margins.left -
-                        term_window->text_margins.right -
-                        border_padding_total;
-
         float char_w = GetAverageCharWidth(term_window->font, term_window->font_size.value);
-        int max_cols = (int)(usable_w / char_w);
-
-        // Subtract 6 columns for safety margin to ensure text never extends past right border
-        if (max_cols > 6) max_cols -= 6;
-        if (max_cols < 20) max_cols = 20;
-        if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+        int max_cols = terminal_cols_for_window(term_window);
 
         // How many rows fit vertically? Account for top padding we added
         float vertical_padding = line_height * 0.75f;
         int max_rows = (int)((content_bottom - content_top - vertical_padding) / line_height);
+        // Subtract 1 row to ensure bottom text is never clipped (character descenders need room)
+        if (max_rows > 1) max_rows -= 1;
         if (max_rows < 1) max_rows = 1;
         if (max_rows > ANSI_BUFFER_ROWS) max_rows = ANSI_BUFFER_ROWS;
 
@@ -1906,33 +2503,38 @@ void render_terminal_content() {
             last_max_cols = max_cols;
         }
 
-        // Auto-scroll to keep cursor visible
+        // Scroll control: manual scroll or auto-follow cursor
         int cursor_x_check, cursor_y_check;
         ansi_get_cursor(&ansi_term, &cursor_x_check, &cursor_y_check);
 
         int start_row = 0;
-        // Always scroll to show cursor with padding, accounting for PTY having 2 fewer rows
-        // PTY has max_rows-2 rows, so cursor maxes at max_rows-3 (0-indexed)
-        if (cursor_y_check > max_rows - 4) {
-            start_row = cursor_y_check - max_rows + 4;
-        }
-        if (start_row < 0) start_row = 0;
-
-        for (int row = 0; row < max_rows; row++) {
-            char line[ANSI_BUFFER_COLS + 1];
-            // Limit line retrieval to max_cols to prevent text extending past boundaries
-            ansi_get_line(&ansi_term, start_row + row, line, max_cols + 1);
-
-            if (line[0] != '\0') {
-                RenderText(term_window->font, line,
-                           x, y,
-                           term_window->font_size.value,
-                           term_window->line_spacing.value);
+        if (ansi_is_alt_screen(&ansi_term)) {
+            // The alternate screen has no scrollback: it is exactly the
+            // visible screen, so it is always drawn from row 0.
+            start_row = 0;
+        } else if (ansi_scroll_offset == 0) {
+            // Auto-scroll to keep cursor visible (default behavior)
+            // PTY has max_rows-2 rows, so cursor maxes at max_rows-3 (0-indexed)
+            if (cursor_y_check > max_rows - 4) {
+                start_row = cursor_y_check - max_rows + 4;
             }
-            y += line_height;
+            if (start_row < 0) start_row = 0;
+        } else {
+            // Manual scroll mode: use ansi_scroll_offset
+            start_row = ansi_scroll_offset;
+            if (start_row < 0) start_row = 0;
+            if (start_row > ANSI_BUFFER_ROWS - max_rows) {
+                start_row = ANSI_BUFFER_ROWS - max_rows;
+            }
         }
+
+        render_ansi_pane(&ansi_term, term_window, start_row, max_rows, max_cols,
+                         x, y, line_height);
 
         glDisable(GL_SCISSOR_TEST);
+
+        // Mark terminal as clean after rendering
+        ansi_mark_clean(&ansi_term);
 
         // Render focus indicator in bottom left corner (after scissor test is disabled)
         // Show in split mode when left is focused, or in single terminal mode
@@ -1958,24 +2560,15 @@ void render_terminal_content() {
 
     // Non-interactive mode - scrollback rendering
     // Calculate max_cols for input prompt truncation
-    float border_padding_total = term_window->border_size.size * 2.0f;
-    float usable_w = term_window->size.width -
-                    term_window->text_margins.left -
-                    term_window->text_margins.right -
-                    border_padding_total;
-    float char_w = GetAverageCharWidth(term_window->font, term_window->font_size.value);
-    int max_cols = (int)(usable_w / char_w);
-    if (max_cols > 6) max_cols -= 6;
-    if (max_cols < 20) max_cols = 20;
-    if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+    int max_cols = terminal_cols_for_window(term_window);
 
     float available_height = content_bottom - content_top - line_height; // Reserve space for input prompt (1 line)
     int max_visible_lines = (int)(available_height / line_height);
     if (max_visible_lines < 1) max_visible_lines = 1;
 
     int start_line = terminal.scroll_offset;
-    int end_line = (terminal.line_count < start_line + max_visible_lines - 1) ?
-                    terminal.line_count : start_line + max_visible_lines - 1;
+    int end_line = (terminal.line_count < start_line + max_visible_lines) ?
+                    terminal.line_count : start_line + max_visible_lines;
 
     for (int i = start_line; i < end_line; i++) {
         if (i >= 0 && i < terminal.line_count) {
@@ -1991,8 +2584,10 @@ void render_terminal_content() {
     }
 
     // Render input prompt with cursor at correct position
+    // Support multi-line wrapping when prompt + input exceeds max_cols
     char prompt_line[MAX_LINE_LENGTH * 2];
 
+    // Build the full prompt line with cursor
     if (terminal.cursor_visible && terminal.cursor_pos < (int)strlen(terminal.input_buffer)) {
         // Cursor is in the middle - insert it at cursor_pos
         snprintf(prompt_line, sizeof(prompt_line), "%s", terminal.prompt);
@@ -2008,13 +2603,29 @@ void render_terminal_content() {
         }
     }
 
-    // Truncate prompt_line to max_cols to prevent overflow past border
-    if ((int)strlen(prompt_line) > max_cols) {
-        prompt_line[max_cols] = '\0';
-    }
+    // Wrap the prompt line if it's too long
+    int prompt_len = strlen(prompt_line);
+    if (prompt_len <= max_cols) {
+        // Single line - render normally
+        RenderText(term_window->font, prompt_line, x, y,
+                  term_window->font_size.value, term_window->line_spacing.value);
+    } else {
+        // Multi-line - wrap and render
+        int pos = 0;
+        while (pos < prompt_len) {
+            char line_segment[MAX_LINE_LENGTH];
+            int chars_to_render = (prompt_len - pos < max_cols) ? prompt_len - pos : max_cols;
 
-    RenderText(term_window->font, prompt_line, x, y,
-              term_window->font_size.value, term_window->line_spacing.value);
+            strncpy(line_segment, prompt_line + pos, chars_to_render);
+            line_segment[chars_to_render] = '\0';
+
+            RenderText(term_window->font, line_segment, x, y,
+                      term_window->font_size.value, term_window->line_spacing.value);
+
+            y += line_height;
+            pos += chars_to_render;
+        }
+    }
 
     glDisable(GL_SCISSOR_TEST);
 }
@@ -2022,6 +2633,7 @@ void render_terminal_content() {
 // Render right terminal content (for split mode)
 void render_terminal_content_right() {
     if (!term_window_right || !term_window_right->font) return;
+
 
     ScreenCoord pos = wm_calculate_position(&wm, term_window_right);
 
@@ -2041,61 +2653,66 @@ void render_terminal_content_right() {
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
     // Enable scissor test to clip text to content area
+    // A pane squeezed past its chrome yields a negative rectangle, which
+    // glScissor rejects outright - leaving the previous pane's rectangle in
+    // force and clipping this one away entirely. Clamp instead so an
+    // over-small pane simply draws nothing.
+    int scissor_w = (int)(content_right - content_left);
+    int scissor_h = (int)(content_bottom - content_top);
+    if (scissor_w < 0) scissor_w = 0;
+    if (scissor_h < 0) scissor_h = 0;
+
     glEnable(GL_SCISSOR_TEST);
     glScissor(
         (int)content_left,
-        (int)(wm.screen_size.height - content_bottom),
-        (int)(content_right - content_left),
-        (int)(content_bottom - content_top)
+        (int)(wm.screen_size.height - content_bottom),  // OpenGL scissor is from bottom
+        scissor_w,
+        scissor_h
     );
 
     if (interactive_mode_right) {
-        // Calculate how many columns fit horizontally
-        float border_padding_total = term_window_right->border_size.size * 2.0f;
-        float usable_w = term_window_right->size.width -
-                        term_window_right->text_margins.left -
-                        term_window_right->text_margins.right -
-                        border_padding_total;
-
-        float char_w = GetAverageCharWidth(term_window_right->font, term_window_right->font_size.value);
-        int max_cols = (int)(usable_w / char_w);
-
-        if (max_cols > 3) max_cols -= 3;
-        if (max_cols < 20) max_cols = 20;
-        if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+        int max_cols = terminal_cols_for_window(term_window_right);
 
         // Calculate rows
         float vertical_padding = line_height * 0.75f;
         int max_rows = (int)((content_bottom - content_top - vertical_padding) / line_height);
+        // Subtract 1 row to ensure bottom text is never clipped (character descenders need room)
+        if (max_rows > 1) max_rows -= 1;
         if (max_rows < 1) max_rows = 1;
         if (max_rows > ANSI_BUFFER_ROWS) max_rows = ANSI_BUFFER_ROWS;
 
-        // Auto-scroll to keep cursor visible
+        // Scroll control: manual scroll or auto-follow cursor
         int cursor_x_check, cursor_y_check;
         ansi_get_cursor(&ansi_term_right, &cursor_x_check, &cursor_y_check);
 
         int start_row = 0;
-        // Always scroll to show cursor with padding, accounting for PTY having 2 fewer rows
-        // PTY has max_rows-2 rows, so cursor maxes at max_rows-3 (0-indexed)
-        if (cursor_y_check > max_rows - 4) {
-            start_row = cursor_y_check - max_rows + 4;
-        }
-        if (start_row < 0) start_row = 0;
-
-        for (int row = 0; row < max_rows; row++) {
-            char line[ANSI_BUFFER_COLS + 1];
-            ansi_get_line(&ansi_term_right, start_row + row, line, max_cols + 1);
-
-            if (line[0] != '\0') {
-                RenderText(term_window_right->font, line,
-                           x, y,
-                           term_window_right->font_size.value,
-                           term_window_right->line_spacing.value);
+        if (ansi_is_alt_screen(&ansi_term_right)) {
+            // The alternate screen has no scrollback: it is exactly the
+            // visible screen, so it is always drawn from row 0.
+            start_row = 0;
+        } else if (ansi_scroll_offset_right == 0) {
+            // Auto-scroll to keep cursor visible (default behavior)
+            // PTY has max_rows-2 rows, so cursor maxes at max_rows-3 (0-indexed)
+            if (cursor_y_check > max_rows - 4) {
+                start_row = cursor_y_check - max_rows + 4;
             }
-            y += line_height;
+            if (start_row < 0) start_row = 0;
+        } else {
+            // Manual scroll mode: use ansi_scroll_offset_right
+            start_row = ansi_scroll_offset_right;
+            if (start_row < 0) start_row = 0;
+            if (start_row > ANSI_BUFFER_ROWS - max_rows) {
+                start_row = ANSI_BUFFER_ROWS - max_rows;
+            }
         }
+
+        render_ansi_pane(&ansi_term_right, term_window_right, start_row, max_rows, max_cols,
+                         x, y, line_height);
 
         glDisable(GL_SCISSOR_TEST);
+
+        // Mark terminal as clean after rendering
+        ansi_mark_clean(&ansi_term_right);
 
         // Render focus indicator in bottom left corner of right terminal (after scissor test is disabled)
         if (focused_terminal == 1) {
@@ -2120,24 +2737,15 @@ void render_terminal_content_right() {
 
     // Non-interactive mode - scrollback rendering
     // Calculate max_cols for input prompt truncation
-    float border_padding_total = term_window_right->border_size.size * 2.0f;
-    float usable_w = term_window_right->size.width -
-                    term_window_right->text_margins.left -
-                    term_window_right->text_margins.right -
-                    border_padding_total;
-    float char_w = GetAverageCharWidth(term_window_right->font, term_window_right->font_size.value);
-    int max_cols = (int)(usable_w / char_w);
-    if (max_cols > 3) max_cols -= 3;
-    if (max_cols < 20) max_cols = 20;
-    if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+    int max_cols = terminal_cols_for_window(term_window_right);
 
     float available_height = content_bottom - content_top - line_height;
     int max_visible_lines = (int)(available_height / line_height);
     if (max_visible_lines < 1) max_visible_lines = 1;
 
     int start_line = terminal_right.scroll_offset;
-    int end_line = (terminal_right.line_count < start_line + max_visible_lines - 1) ?
-                    terminal_right.line_count : start_line + max_visible_lines - 1;
+    int end_line = (terminal_right.line_count < start_line + max_visible_lines) ?
+                    terminal_right.line_count : start_line + max_visible_lines;
 
     for (int i = start_line; i < end_line; i++) {
         if (i >= 0 && i < terminal_right.line_count) {
@@ -2147,9 +2755,11 @@ void render_terminal_content_right() {
         }
     }
 
-    // Render input prompt with cursor
+    // Render input prompt with cursor at correct position
+    // Support multi-line wrapping when prompt + input exceeds max_cols
     char prompt_line[MAX_LINE_LENGTH * 2];
 
+    // Build the full prompt line with cursor
     if (terminal_right.cursor_visible && terminal_right.cursor_pos < (int)strlen(terminal_right.input_buffer)) {
         snprintf(prompt_line, sizeof(prompt_line), "%s", terminal_right.prompt);
         strncat(prompt_line, terminal_right.input_buffer, terminal_right.cursor_pos);
@@ -2163,13 +2773,29 @@ void render_terminal_content_right() {
         }
     }
 
-    // Truncate prompt_line to max_cols to prevent overflow past border
-    if ((int)strlen(prompt_line) > max_cols) {
-        prompt_line[max_cols] = '\0';
-    }
+    // Wrap the prompt line if it's too long
+    int prompt_len = strlen(prompt_line);
+    if (prompt_len <= max_cols) {
+        // Single line - render normally
+        RenderText(term_window_right->font, prompt_line, x, y,
+                  term_window_right->font_size.value, term_window_right->line_spacing.value);
+    } else {
+        // Multi-line - wrap and render
+        int pos = 0;
+        while (pos < prompt_len) {
+            char line_segment[MAX_LINE_LENGTH];
+            int chars_to_render = (prompt_len - pos < max_cols) ? prompt_len - pos : max_cols;
 
-    RenderText(term_window_right->font, prompt_line, x, y,
-              term_window_right->font_size.value, term_window_right->line_spacing.value);
+            strncpy(line_segment, prompt_line + pos, chars_to_render);
+            line_segment[chars_to_render] = '\0';
+
+            RenderText(term_window_right->font, line_segment, x, y,
+                      term_window_right->font_size.value, term_window_right->line_spacing.value);
+
+            y += line_height;
+            pos += chars_to_render;
+        }
+    }
 
     glDisable(GL_SCISSOR_TEST);
 }
@@ -2177,6 +2803,7 @@ void render_terminal_content_right() {
 // Render bottom terminal content (for split mode)
 void render_terminal_content_bottom() {
     if (!term_window_bottom || !term_window_bottom->font) return;
+
 
     ScreenCoord pos = wm_calculate_position(&wm, term_window_bottom);
 
@@ -2196,57 +2823,65 @@ void render_terminal_content_bottom() {
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
     // Enable scissor test to clip text to content area
+    // A pane squeezed past its chrome yields a negative rectangle, which
+    // glScissor rejects outright - leaving the previous pane's rectangle in
+    // force and clipping this one away entirely. Clamp instead so an
+    // over-small pane simply draws nothing.
+    int scissor_w = (int)(content_right - content_left);
+    int scissor_h = (int)(content_bottom - content_top);
+    if (scissor_w < 0) scissor_w = 0;
+    if (scissor_h < 0) scissor_h = 0;
+
     glEnable(GL_SCISSOR_TEST);
     glScissor(
         (int)content_left,
-        (int)(wm.screen_size.height - content_bottom),
-        (int)(content_right - content_left),
-        (int)(content_bottom - content_top)
+        (int)(wm.screen_size.height - content_bottom),  // OpenGL scissor is from bottom
+        scissor_w,
+        scissor_h
     );
 
     // Interactive mode
     if (interactive_mode_bottom) {
-        float border_padding_total = term_window_bottom->border_size.size * 2.0f;
-        float usable_w = term_window_bottom->size.width -
-                        term_window_bottom->text_margins.left -
-                        term_window_bottom->text_margins.right -
-                        border_padding_total;
-
-        float char_w = GetAverageCharWidth(term_window_bottom->font, term_window_bottom->font_size.value);
-        int max_cols = (int)(usable_w / char_w);
-
-        if (max_cols > 3) max_cols -= 3;
-        if (max_cols < 20) max_cols = 20;
-        if (max_cols > ANSI_BUFFER_COLS) max_cols = ANSI_BUFFER_COLS;
+        int max_cols = terminal_cols_for_window(term_window_bottom);
 
         float vertical_padding = line_height * 0.75f;
         int max_rows = (int)((content_bottom - content_top - vertical_padding) / line_height);
+        // Subtract 1 row to ensure bottom text is never clipped (character descenders need room)
+        if (max_rows > 1) max_rows -= 1;
         if (max_rows < 1) max_rows = 1;
         if (max_rows > ANSI_BUFFER_ROWS) max_rows = ANSI_BUFFER_ROWS;
 
+        // Scroll control: manual scroll or auto-follow cursor
         int cursor_x_check, cursor_y_check;
         ansi_get_cursor(&ansi_term_bottom, &cursor_x_check, &cursor_y_check);
 
         int start_row = 0;
-        if (cursor_y_check > max_rows - 4) {
-            start_row = cursor_y_check - max_rows + 4;
-        }
-        if (start_row < 0) start_row = 0;
-
-        for (int row = 0; row < max_rows; row++) {
-            char line[ANSI_BUFFER_COLS + 1];
-            ansi_get_line(&ansi_term_bottom, start_row + row, line, max_cols + 1);
-
-            if (line[0] != '\0') {
-                RenderText(term_window_bottom->font, line,
-                           x, y,
-                           term_window_bottom->font_size.value,
-                           term_window_bottom->line_spacing.value);
+        if (ansi_is_alt_screen(&ansi_term_bottom)) {
+            // The alternate screen has no scrollback: it is exactly the
+            // visible screen, so it is always drawn from row 0.
+            start_row = 0;
+        } else if (ansi_scroll_offset_bottom == 0) {
+            // Auto-scroll to keep cursor visible (default behavior)
+            if (cursor_y_check > max_rows - 4) {
+                start_row = cursor_y_check - max_rows + 4;
             }
-            y += line_height;
+            if (start_row < 0) start_row = 0;
+        } else {
+            // Manual scroll mode: use ansi_scroll_offset_bottom
+            start_row = ansi_scroll_offset_bottom;
+            if (start_row < 0) start_row = 0;
+            if (start_row > ANSI_BUFFER_ROWS - max_rows) {
+                start_row = ANSI_BUFFER_ROWS - max_rows;
+            }
         }
+
+        render_ansi_pane(&ansi_term_bottom, term_window_bottom, start_row, max_rows, max_cols,
+                         x, y, line_height);
 
         glDisable(GL_SCISSOR_TEST);
+
+        // Mark terminal as clean after rendering
+        ansi_mark_clean(&ansi_term_bottom);
 
         // Render focus indicator
         if (focused_terminal == 1) {
@@ -2288,6 +2923,195 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
 
             if (index >= 0 && index < MENU_ITEM_COUNT)
                 context_menu.selected_item = index;     // 0 = top, 5 = bottom
+        }
+    }
+}
+
+// Mouse scroll callback
+void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
+    (void)window;
+    (void)xoffset;
+
+    // Determine which terminal window the mouse is over
+    double mouse_x = context_menu.mouse_x;
+    double mouse_y = context_menu.mouse_y;
+
+    // Check which terminal the mouse is over and scroll it
+    TerminalState* target_term = NULL;
+    Window* target_window = NULL;
+
+    // Helper to check if point is inside window bounds
+    if (split_horizontal) {
+        // Horizontal split: check right terminal first, then left
+        if (term_window_right) {
+            ScreenCoord pos = wm_calculate_position(&wm, term_window_right);
+            if (mouse_x >= pos.x && mouse_x <= pos.x + term_window_right->size.width &&
+                mouse_y >= pos.y && mouse_y <= pos.y + term_window_right->size.height) {
+                target_term = &terminal_right;
+                target_window = term_window_right;
+            }
+        }
+        if (!target_term && term_window) {
+            ScreenCoord pos = wm_calculate_position(&wm, term_window);
+            if (mouse_x >= pos.x && mouse_x <= pos.x + term_window->size.width &&
+                mouse_y >= pos.y && mouse_y <= pos.y + term_window->size.height) {
+                target_term = &terminal;
+                target_window = term_window;
+            }
+        }
+    } else if (split_vertical) {
+        // Vertical split: check bottom terminal first, then top
+        if (term_window_bottom) {
+            ScreenCoord pos = wm_calculate_position(&wm, term_window_bottom);
+            if (mouse_x >= pos.x && mouse_x <= pos.x + term_window_bottom->size.width &&
+                mouse_y >= pos.y && mouse_y <= pos.y + term_window_bottom->size.height) {
+                target_term = &terminal_bottom;
+                target_window = term_window_bottom;
+            }
+        }
+        if (!target_term && term_window) {
+            ScreenCoord pos = wm_calculate_position(&wm, term_window);
+            if (mouse_x >= pos.x && mouse_x <= pos.x + term_window->size.width &&
+                mouse_y >= pos.y && mouse_y <= pos.y + term_window->size.height) {
+                target_term = &terminal;
+                target_window = term_window;
+            }
+        }
+    } else {
+        // Single terminal mode
+        if (term_window) {
+            ScreenCoord pos = wm_calculate_position(&wm, term_window);
+            if (mouse_x >= pos.x && mouse_x <= pos.x + term_window->size.width &&
+                mouse_y >= pos.y && mouse_y <= pos.y + term_window->size.height) {
+                target_term = &terminal;
+                target_window = term_window;
+            }
+        }
+    }
+
+    if (target_term && target_window && target_window->font) {
+        // Determine if this terminal is in interactive mode
+        bool is_interactive = false;
+        int* ansi_scroll_ptr = NULL;
+
+        if (split_horizontal && target_term == &terminal_right && interactive_mode_right) {
+            is_interactive = true;
+            ansi_scroll_ptr = &ansi_scroll_offset_right;
+        } else if (split_vertical && target_term == &terminal_bottom && interactive_mode_bottom) {
+            is_interactive = true;
+            ansi_scroll_ptr = &ansi_scroll_offset_bottom;
+        } else if (target_term == &terminal && interactive_mode) {
+            is_interactive = true;
+            ansi_scroll_ptr = &ansi_scroll_offset;
+        }
+
+        if (is_interactive && ansi_scroll_ptr) {
+            // Interactive mode: scroll the ANSI buffer
+            int cursor_x, cursor_y;
+            AnsiTerminal* ansi_term_ptr = NULL;
+
+            if (split_horizontal && target_term == &terminal_right) {
+                ansi_term_ptr = &ansi_term_right;
+            } else if (split_vertical && target_term == &terminal_bottom) {
+                ansi_term_ptr = &ansi_term_bottom;
+            } else if (target_term == &terminal) {
+                ansi_term_ptr = &ansi_term;
+            }
+
+            if (ansi_term_ptr) {
+                ansi_get_cursor(ansi_term_ptr, &cursor_x, &cursor_y);
+
+                float line_height = target_window->font_size.value * 16.0f *
+                                   (1.0f + target_window->line_spacing.value);
+                float available_height = target_window->size.height -
+                                        target_window->text_margins.top -
+                                        target_window->text_margins.bottom;
+                int max_visible_lines = (int)(available_height / line_height);
+                if (max_visible_lines < 1) max_visible_lines = 1;
+
+                // Calculate what auto-follow position would be
+                int auto_follow_row = 0;
+                if (cursor_y > max_visible_lines - 4) {
+                    auto_follow_row = cursor_y - max_visible_lines + 4;
+                }
+                if (auto_follow_row < 0) auto_follow_row = 0;
+
+                // Calculate current start_row (what we're actually displaying)
+                int current_start_row;
+                if (*ansi_scroll_ptr == 0) {
+                    // In auto-follow mode
+                    current_start_row = auto_follow_row;
+                } else {
+                    // In manual scroll mode
+                    current_start_row = *ansi_scroll_ptr;
+                }
+
+                // Apply scroll: UP decreases start_row (older), DOWN increases (newer)
+                // yoffset > 0 = scroll UP = view older = decrease start_row
+                // yoffset < 0 = scroll DOWN = view newer = increase start_row
+                int scroll_amount = (int)(yoffset * 3.0);
+                int new_start_row = current_start_row - scroll_amount;
+
+                // The ANSI buffer is a ring buffer - be very conservative to avoid wrap-around
+                // Only allow scrolling back through content that's definitely still valid
+                int min_scroll = 0;
+
+                // Conservative limit: don't scroll back more than (buffer_size - max_visible - margin)
+                // This ensures we never hit wrapped/overwritten content
+                int safe_scrollback = ANSI_BUFFER_ROWS - max_visible_lines - 50;
+                if (safe_scrollback < 0) safe_scrollback = 0;
+
+                if (cursor_y > safe_scrollback) {
+                    min_scroll = cursor_y - safe_scrollback;
+                }
+
+                // Maximum scroll position: don't scroll past the cursor
+                int max_scroll = cursor_y;
+                if (max_scroll < 0) max_scroll = 0;
+
+                // Also ensure we don't exceed buffer boundaries
+                int buffer_max = ANSI_BUFFER_ROWS - max_visible_lines;
+                if (buffer_max < 0) buffer_max = 0;
+                if (max_scroll > buffer_max) max_scroll = buffer_max;
+
+                // Clamp to valid range [min_scroll, max_scroll]
+                if (new_start_row < min_scroll) new_start_row = min_scroll;
+                if (new_start_row > max_scroll) new_start_row = max_scroll;
+
+                // If scrolled to or past auto-follow position, return to auto-follow mode
+                if (new_start_row >= auto_follow_row) {
+                    *ansi_scroll_ptr = 0;  // Return to auto-follow
+                } else {
+                    *ansi_scroll_ptr = new_start_row;
+                }
+            }
+        } else {
+            // Non-interactive mode: use terminal scrollback
+            // yoffset > 0 = scroll UP (view older) = DECREASE offset
+            // yoffset < 0 = scroll DOWN (view newer) = INCREASE offset
+            int scroll_delta = -(int)(yoffset * 3.0);
+
+            float line_height = target_window->font_size.value * 16.0f *
+                               (1.0f + target_window->line_spacing.value);
+            float available_height = target_window->size.height -
+                                    target_window->text_margins.top -
+                                    target_window->text_margins.bottom;
+            int max_visible_lines = (int)(available_height / line_height);
+            if (max_visible_lines < 1) max_visible_lines = 1;
+
+            int max_scroll = target_term->line_count - max_visible_lines + 1;
+            if (max_scroll < 0) max_scroll = 0;
+
+            // Apply scroll delta
+            target_term->scroll_offset += scroll_delta;
+
+            // Clamp to valid range
+            if (target_term->scroll_offset < 0) {
+                target_term->scroll_offset = 0;
+            }
+            if (target_term->scroll_offset > max_scroll) {
+                target_term->scroll_offset = max_scroll;
+            }
         }
     }
 }
@@ -2403,6 +3227,12 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                     size_t clipboard_len = strlen(clipboard_text);
                                     size_t current_len = strlen(terminal.input_buffer);
 
+                                    // Validate cursor position
+                                    if (terminal.cursor_pos < 0 || (size_t)terminal.cursor_pos > current_len) {
+                                        terminal.cursor_pos = current_len;
+                                    }
+
+                                    // Check if there's room (need space for text + null terminator)
                                     if (current_len + clipboard_len < MAX_LINE_LENGTH) {
                                         // Make room for pasted text
                                         memmove(terminal.input_buffer + terminal.cursor_pos + clipboard_len,
@@ -2414,9 +3244,14 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                                clipboard_text, clipboard_len);
 
                                         terminal.cursor_pos += clipboard_len;
-                                        printf("Pasted text to input buffer\n");
+
+                                        // Ensure null termination (defensive)
+                                        terminal.input_buffer[current_len + clipboard_len] = '\0';
+
+                                        printf("Pasted %zu bytes to input buffer\n", clipboard_len);
                                     } else {
-                                        printf("Clipboard text too long to paste\n");
+                                        printf("Clipboard text too long to paste (max %d chars)\n",
+                                               MAX_LINE_LENGTH - 1);
                                     }
                                 }
                             } else {
@@ -2473,6 +3308,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                 term_window_right->font = NULL;
                             }
 
+                            // Clear right terminal buffer
+                            terminal_right.line_count = 0;
+                            terminal_right.raw_line_count = 0;
+                            terminal_right.scroll_offset = 0;
+                            terminal_right.cursor_pos = 0;
+                            terminal_right.input_buffer[0] = '\0';
+                            terminal_right.history_count = 0;
+                            terminal_right.history_index = -1;
+                            ansi_clear(&ansi_term_right);
+                            ansi_scroll_offset_right = 0;
+
                             // Hide right window
                             if (term_window_right) {
                                 wm_hide_window(&wm, term_window_right->name);
@@ -2492,6 +3338,20 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
                             term_window->anchor = ANCHOR_CENTER;
                             term_window->position = SCREEN_COORD(0, 0);
+
+                            // CRITICAL: Recreate 9-slice for restored full-size terminal
+                            NineSliceParams restore_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window->size,
+                                .borderLeft = term_window->border_size,
+                                .borderRight = term_window->border_size,
+                                .borderTop = term_window->border_size,
+                                .borderBottom = term_window->border_size
+                            };
+                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+                            // CRITICAL: Invalidate cache after size change
+                            invalidate_line_width_cache();
 
                             // Rewrap main terminal content for new width
                             rewrap_terminal_content();
@@ -2520,35 +3380,78 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->size = WINDOW_SIZE(half_width, usable_height);
                             term_window->anchor = ANCHOR_CENTER_LEFT;
                             term_window->position = SCREEN_COORD(WINDOW_EDGE_PADDING, 0);
-                            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            // Keep existing margins (don't reset user adjustments)
                             term_window->center_alpha = 0.9f;
+
+                            // CRITICAL: Recreate 9-slice for left terminal with new size
+                            NineSliceParams left_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window->size,
+                                .borderLeft = term_window->border_size,
+                                .borderRight = term_window->border_size,
+                                .borderTop = term_window->border_size,
+                                .borderBottom = term_window->border_size
+                            };
+                            createNineSlice(&term_window->nine_slice, &left_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+                            // CRITICAL: Invalidate cache after size change
+                            invalidate_line_width_cache();
 
                             // Rewrap left terminal content for new width
                             rewrap_terminal_content();
 
-                            // Create right terminal window
-                            WindowID right_id = wm_create_window(&wm, window_name_from_string("terminal_right"));
-                            term_window_right = &wm.windows[right_id.value];
+                            // CRITICAL: Resize PTY for left terminal (it was just resized to half width)
+                            resize_pty_to_window();
 
-                            // Configure right window
+                            // Create right terminal window
+                            // Reuse this pane's window if an earlier split already
+                            // created it. The window manager is a bump allocator with
+                            // no free list, so making a fresh one on every split walks
+                            // window_count toward MAX_WINDOWS and then hands back an
+                            // invalid id - which this code indexed regardless, writing
+                            // outside the array.
+                            term_window_right = wm_get_window(&wm, window_name_from_string("terminal_right"));
+                            if (!term_window_right) {
+                                WindowID right_id = wm_create_window(&wm, window_name_from_string("terminal_right"));
+                                term_window_right = window_id_is_valid(right_id)
+                                               ? &wm.windows[right_id.value] : NULL;
+                            }
+                            if (!term_window_right) {
+                                fprintf(stderr, "Cannot split: no window slots available\n");
+                                split_horizontal = false;
+                                int restore_w = 0, restore_h = 0;
+                                glfwGetWindowSize(window, &restore_w, &restore_h);
+                                term_window->size = WINDOW_SIZE(restore_w - 40, restore_h - 40);
+                                term_window->anchor = ANCHOR_CENTER;
+                                term_window->position = SCREEN_COORD(0, 0);
+                                resize_pty_to_window();
+                                break;
+                            }
+
+                            // Configure right window - FIXED: Copy layout from left terminal
                             term_window_right->anchor = ANCHOR_CENTER_RIGHT;
                             term_window_right->position = SCREEN_COORD(-WINDOW_EDGE_PADDING, 0);
                             term_window_right->size = WINDOW_SIZE(half_width, usable_height);
                             term_window_right->texture_path = font_path_from_string("assets/ui/9-slice-basice9.png");
                             term_window_right->text_color = TEXT_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
                             term_window_right->font_size = FONT_SIZE(1.0f);
-                            term_window_right->border_size = BORDER_SIZE(8);
+                            // FIXED: Copy border size from left terminal instead of hardcoding
+                            term_window_right->border_size = term_window->border_size;
                             term_window_right->line_spacing = LINE_SPACING(0.30f);
-                            term_window_right->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                                          TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            // FIXED: Copy margins from left terminal for identical padding
+                            term_window_right->text_margins = term_window->text_margins;
                             term_window_right->center_alpha = 0.9f;
 
-                            // CRITICAL: Load separate font for right terminal to prevent double-free
-                            term_window_right->font = LoadFont("assets/fonts/font_basis33.json",
-                                                              "assets/fonts/font_basis33.png");
+                            // CRITICAL: separate font instance per pane to prevent a
+                            // double free. Only load it the first time this pane's
+                            // window is set up, or reusing the window leaks one font
+                            // per split.
                             if (!term_window_right->font) {
-                                fprintf(stderr, "Failed to load font for right terminal\n");
+                                term_window_right->font = LoadFont("assets/fonts/font_basis33.json",
+                                                                "assets/fonts/font_basis33.png");
+                                if (!term_window_right->font) {
+                                    fprintf(stderr, "Failed to load font for right terminal\n");
+                                }
                             }
 
                             // Initialize right terminal
@@ -2559,9 +3462,30 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             terminal_right.input_buffer[0] = '\0';
 
                             // Start separate shell for right terminal
+                            // Calculate actual window size
+                            int rows = 24, cols = 80;
+                            if (term_window_right && term_window_right->font) {
+                                float char_h = term_window_right->font_size.value * 16.0f * (1.0f + term_window_right->line_spacing.value);
+                                float border_padding = term_window_right->border_size.size * 2.0f;
+                                float usable_h = term_window_right->size.height - term_window_right->text_margins.top -
+                                                term_window_right->text_margins.bottom - border_padding;
+
+                                // Account for vertical padding (matches rendering)
+                                float vertical_padding_right = char_h * 0.75f;
+                                usable_h -= vertical_padding_right;
+
+                                cols = terminal_cols_for_window(term_window_right);
+                                rows = (int)(usable_h / char_h);
+                                if (rows > 3) rows -= 3;  // Match PTY resize: 2 for safety + 1 for descender clipping
+                                if (rows < 10) rows = 10;
+                                if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+                            }
+
+                            // Autowrap at exactly the width the child is told.
+                            ansi_set_size(&ansi_term_right, cols, rows);
                             struct winsize ws = {
-                                .ws_row = ANSI_BUFFER_ROWS,
-                                .ws_col = ANSI_BUFFER_COLS,
+                                .ws_row = rows,
+                                .ws_col = cols,
                                 .ws_xpixel = 0,
                                 .ws_ypixel = 0
                             };
@@ -2583,8 +3507,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                     tcsetattr(STDIN_FILENO, TCSANOW, &tios);
                                 }
 
-                                execlp("bash", "bash", "-i", (char*)NULL);
-                                perror("execlp right terminal");
+                                exec_default_shell();
                                 _exit(1);
                             } else {
                                 // Parent: set non-blocking
@@ -2598,6 +3521,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                 // Set correct terminal size for the right PTY
                                 resize_pty_to_window_right();
                             }
+
+                            // CRITICAL: Create 9-slice for right terminal before showing
+                            NineSliceParams right_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window_right->size,
+                                .borderLeft = term_window_right->border_size,
+                                .borderRight = term_window_right->border_size,
+                                .borderTop = term_window_right->border_size,
+                                .borderBottom = term_window_right->border_size
+                            };
+                            createNineSlice(&term_window_right->nine_slice, &right_params, WINDOW_SIZE(32, 32), term_window_right->texture_path.value);
 
                             wm_show_window(&wm, term_window_right->name);
                             printf("Vertical split enabled - two independent terminals with separate fonts\n");
@@ -2628,6 +3562,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                 term_window_bottom->font = NULL;
                             }
 
+                            // Clear bottom terminal buffer
+                            terminal_bottom.line_count = 0;
+                            terminal_bottom.raw_line_count = 0;
+                            terminal_bottom.scroll_offset = 0;
+                            terminal_bottom.cursor_pos = 0;
+                            terminal_bottom.input_buffer[0] = '\0';
+                            terminal_bottom.history_count = 0;
+                            terminal_bottom.history_index = -1;
+                            ansi_clear(&ansi_term_bottom);
+                            ansi_scroll_offset_bottom = 0;
+
                             // Hide bottom window
                             if (term_window_bottom) {
                                 wm_hide_window(&wm, term_window_bottom->name);
@@ -2647,6 +3592,20 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
                             term_window->anchor = ANCHOR_CENTER;
                             term_window->position = SCREEN_COORD(0, 0);
+
+                            // CRITICAL: Recreate 9-slice for restored full-size terminal
+                            NineSliceParams restore_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window->size,
+                                .borderLeft = term_window->border_size,
+                                .borderRight = term_window->border_size,
+                                .borderTop = term_window->border_size,
+                                .borderBottom = term_window->border_size
+                            };
+                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+                            // CRITICAL: Invalidate cache after size change
+                            invalidate_line_width_cache();
 
                             // Rewrap main terminal content for new width
                             rewrap_terminal_content();
@@ -2675,35 +3634,78 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->size = WINDOW_SIZE(usable_width, half_height);
                             term_window->anchor = ANCHOR_TOP_CENTER;
                             term_window->position = SCREEN_COORD(0, WINDOW_EDGE_PADDING);
-                            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            // Keep existing margins (don't reset user adjustments)
                             term_window->center_alpha = 0.9f;
+
+                            // CRITICAL: Recreate 9-slice for top terminal with new size
+                            NineSliceParams top_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window->size,
+                                .borderLeft = term_window->border_size,
+                                .borderRight = term_window->border_size,
+                                .borderTop = term_window->border_size,
+                                .borderBottom = term_window->border_size
+                            };
+                            createNineSlice(&term_window->nine_slice, &top_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+                            // CRITICAL: Invalidate cache after size change
+                            invalidate_line_width_cache();
 
                             // Rewrap top terminal content for new height
                             rewrap_terminal_content();
 
-                            // Create bottom terminal window
-                            WindowID bottom_id = wm_create_window(&wm, window_name_from_string("terminal_bottom"));
-                            term_window_bottom = &wm.windows[bottom_id.value];
+                            // CRITICAL: Resize PTY for top terminal (it was just resized to half height)
+                            resize_pty_to_window();
 
-                            // Configure bottom window
+                            // Create bottom terminal window
+                            // Reuse this pane's window if an earlier split already
+                            // created it. The window manager is a bump allocator with
+                            // no free list, so making a fresh one on every split walks
+                            // window_count toward MAX_WINDOWS and then hands back an
+                            // invalid id - which this code indexed regardless, writing
+                            // outside the array.
+                            term_window_bottom = wm_get_window(&wm, window_name_from_string("terminal_bottom"));
+                            if (!term_window_bottom) {
+                                WindowID bottom_id = wm_create_window(&wm, window_name_from_string("terminal_bottom"));
+                                term_window_bottom = window_id_is_valid(bottom_id)
+                                               ? &wm.windows[bottom_id.value] : NULL;
+                            }
+                            if (!term_window_bottom) {
+                                fprintf(stderr, "Cannot split: no window slots available\n");
+                                split_vertical = false;
+                                int restore_w = 0, restore_h = 0;
+                                glfwGetWindowSize(window, &restore_w, &restore_h);
+                                term_window->size = WINDOW_SIZE(restore_w - 40, restore_h - 40);
+                                term_window->anchor = ANCHOR_CENTER;
+                                term_window->position = SCREEN_COORD(0, 0);
+                                resize_pty_to_window();
+                                break;
+                            }
+
+                            // Configure bottom window - FIXED: Copy layout from top terminal
                             term_window_bottom->anchor = ANCHOR_BOTTOM_CENTER;
                             term_window_bottom->position = SCREEN_COORD(0, -WINDOW_EDGE_PADDING);
                             term_window_bottom->size = WINDOW_SIZE(usable_width, half_height);
                             term_window_bottom->texture_path = font_path_from_string("assets/ui/9-slice-basice9.png");
                             term_window_bottom->text_color = TEXT_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
                             term_window_bottom->font_size = FONT_SIZE(1.0f);
-                            term_window_bottom->border_size = BORDER_SIZE(8);
+                            // FIXED: Copy border size from top terminal instead of hardcoding
+                            term_window_bottom->border_size = term_window->border_size;
                             term_window_bottom->line_spacing = LINE_SPACING(0.30f);
-                            term_window_bottom->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                                           TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+                            // FIXED: Copy margins from top terminal for identical padding
+                            term_window_bottom->text_margins = term_window->text_margins;
                             term_window_bottom->center_alpha = 0.9f;
 
-                            // CRITICAL: Load separate font for bottom terminal to prevent double-free
-                            term_window_bottom->font = LoadFont("assets/fonts/font_basis33.json",
-                                                               "assets/fonts/font_basis33.png");
+                            // CRITICAL: separate font instance per pane to prevent a
+                            // double free. Only load it the first time this pane's
+                            // window is set up, or reusing the window leaks one font
+                            // per split.
                             if (!term_window_bottom->font) {
-                                fprintf(stderr, "Failed to load font for bottom terminal\n");
+                                term_window_bottom->font = LoadFont("assets/fonts/font_basis33.json",
+                                                                    "assets/fonts/font_basis33.png");
+                                if (!term_window_bottom->font) {
+                                    fprintf(stderr, "Failed to load font for bottom terminal\n");
+                                }
                             }
 
                             // Initialize bottom terminal
@@ -2714,9 +3716,30 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             terminal_bottom.input_buffer[0] = '\0';
 
                             // Start separate shell for bottom terminal
+                            // Calculate actual window size
+                            int rows = 24, cols = 80;
+                            if (term_window_bottom && term_window_bottom->font) {
+                                float char_h = term_window_bottom->font_size.value * 16.0f * (1.0f + term_window_bottom->line_spacing.value);
+                                float border_padding = term_window_bottom->border_size.size * 2.0f;
+                                float usable_h = term_window_bottom->size.height - term_window_bottom->text_margins.top -
+                                                term_window_bottom->text_margins.bottom - border_padding;
+
+                                // Account for vertical padding (matches rendering)
+                                float vertical_padding_bottom = char_h * 0.75f;
+                                usable_h -= vertical_padding_bottom;
+
+                                cols = terminal_cols_for_window(term_window_bottom);
+                                rows = (int)(usable_h / char_h);
+                                if (rows > 3) rows -= 3;  // Match PTY resize: 2 for safety + 1 for descender clipping
+                                if (rows < 10) rows = 10;
+                                if (rows > ANSI_BUFFER_ROWS) rows = ANSI_BUFFER_ROWS;
+                            }
+
+                            // Autowrap at exactly the width the child is told.
+                            ansi_set_size(&ansi_term_bottom, cols, rows);
                             struct winsize ws = {
-                                .ws_row = ANSI_BUFFER_ROWS,
-                                .ws_col = ANSI_BUFFER_COLS,
+                                .ws_row = rows,
+                                .ws_col = cols,
                                 .ws_xpixel = 0,
                                 .ws_ypixel = 0
                             };
@@ -2738,8 +3761,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                     tcsetattr(STDIN_FILENO, TCSANOW, &tios);
                                 }
 
-                                execlp("bash", "bash", "-i", (char*)NULL);
-                                perror("execlp bottom terminal");
+                                exec_default_shell();
                                 _exit(1);
                             } else {
                                 // Parent: set non-blocking
@@ -2753,6 +3775,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                 // Set correct terminal size for the bottom PTY
                                 resize_pty_to_window_bottom();
                             }
+
+                            // CRITICAL: Create 9-slice for bottom terminal before showing
+                            NineSliceParams bottom_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window_bottom->size,
+                                .borderLeft = term_window_bottom->border_size,
+                                .borderRight = term_window_bottom->border_size,
+                                .borderTop = term_window_bottom->border_size,
+                                .borderBottom = term_window_bottom->border_size
+                            };
+                            createNineSlice(&term_window_bottom->nine_slice, &bottom_params, WINDOW_SIZE(32, 32), term_window_bottom->texture_path.value);
 
                             wm_show_window(&wm, term_window_bottom->name);
                             printf("Horizontal split enabled - two independent terminals (top/bottom)\n");
@@ -2783,6 +3816,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                 term_window_right->font = NULL;
                             }
 
+                            // Clear right terminal buffer
+                            terminal_right.line_count = 0;
+                            terminal_right.raw_line_count = 0;
+                            terminal_right.scroll_offset = 0;
+                            terminal_right.cursor_pos = 0;
+                            terminal_right.input_buffer[0] = '\0';
+                            terminal_right.history_count = 0;
+                            terminal_right.history_index = -1;
+                            ansi_clear(&ansi_term_right);
+                            ansi_scroll_offset_right = 0;
+
                             // Hide right window
                             if (term_window_right) {
                                 wm_hide_window(&wm, term_window_right->name);
@@ -2802,6 +3846,20 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->size = WINDOW_SIZE(current_width - 40, current_height - 40);
                             term_window->anchor = ANCHOR_CENTER;
                             term_window->position = SCREEN_COORD(0, 0);
+
+                            // CRITICAL: Recreate 9-slice for restored full-size terminal
+                            NineSliceParams restore_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window->size,
+                                .borderLeft = term_window->border_size,
+                                .borderRight = term_window->border_size,
+                                .borderTop = term_window->border_size,
+                                .borderBottom = term_window->border_size
+                            };
+                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+                            // CRITICAL: Invalidate cache after size change
+                            invalidate_line_width_cache();
 
                             // Rewrap main terminal content for new width
                             rewrap_terminal_content();
@@ -2833,6 +3891,17 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                                 term_window_bottom->font = NULL;
                             }
 
+                            // Clear bottom terminal buffer
+                            terminal_bottom.line_count = 0;
+                            terminal_bottom.raw_line_count = 0;
+                            terminal_bottom.scroll_offset = 0;
+                            terminal_bottom.cursor_pos = 0;
+                            terminal_bottom.input_buffer[0] = '\0';
+                            terminal_bottom.history_count = 0;
+                            terminal_bottom.history_index = -1;
+                            ansi_clear(&ansi_term_bottom);
+                            ansi_scroll_offset_bottom = 0;
+
                             // Hide bottom window
                             if (term_window_bottom) {
                                 wm_hide_window(&wm, term_window_bottom->name);
@@ -2853,6 +3922,20 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             term_window->anchor = ANCHOR_CENTER;
                             term_window->position = SCREEN_COORD(0, 0);
 
+                            // CRITICAL: Recreate 9-slice for restored full-size terminal
+                            NineSliceParams restore_params = {
+                                .position = SCREEN_COORD(0, 0),
+                                .size = term_window->size,
+                                .borderLeft = term_window->border_size,
+                                .borderRight = term_window->border_size,
+                                .borderTop = term_window->border_size,
+                                .borderBottom = term_window->border_size
+                            };
+                            createNineSlice(&term_window->nine_slice, &restore_params, WINDOW_SIZE(32, 32), term_window->texture_path.value);
+
+                            // CRITICAL: Invalidate cache after size change
+                            invalidate_line_width_cache();
+
                             // Rewrap main terminal content for new width
                             rewrap_terminal_content();
 
@@ -2864,7 +3947,11 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                             printf("No split to close - already in single terminal mode\n");
                         }
                         break;
-                    case 8:  // Exit
+                    case MENU_ITEM_SOUND:  // Sound on/off
+                        sound_set_enabled(!sound_is_enabled());
+                        printf("Sound %s\n", sound_is_enabled() ? "enabled" : "disabled");
+                        break;
+                    case 9:  // Exit
                         glfwSetWindowShouldClose(window, GLFW_TRUE);
                         break;
                 }
@@ -2942,7 +4029,7 @@ void render_context_menu() {
         glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         if (term_window && term_window->font) {
             RenderText(term_window->font,
-                       menu_items[i],
+                       menu_item_label(i),
                        context_menu.x + 10,
                        item_y + context_menu.text_y_offset,
                        1.0f,
@@ -2965,47 +4052,83 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
     // Update window manager screen size
     wm.screen_size = SCREEN_SIZE(width, height);
 
+    // CRITICAL: Invalidate cached line width since window size changed
+    invalidate_line_width_cache();
+
     // Update terminal window sizes
     if (split_horizontal) {
-        // Recalculate horizontal split sizes (left/right)
+        // Recalculate horizontal split sizes (left/right) - COMPLETELY reset layout
         int usable_width = width - (WINDOW_EDGE_PADDING * 2);
         int usable_height = height - (WINDOW_EDGE_PADDING * 2);
         int half_width = (usable_width - TERMINAL_GAP) / 2;
 
+        // The size limit should keep us well clear of this, but a window
+        // manager is free to ignore it. A pane thinner than its own border
+        // inverts the 9-slice quads and draws a scrambled frame.
+        int min_pane = (int)(term_window ? term_window->border_size.size * 4 : 32);
+        if (half_width < min_pane) half_width = min_pane;
+        if (usable_height < min_pane) usable_height = min_pane;
+
         if (term_window) {
+            // FULL RESET: size, anchor, position (as if splitting fresh)
             term_window->size = WINDOW_SIZE(half_width, usable_height);
-            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+            term_window->anchor = ANCHOR_CENTER_LEFT;
+            term_window->position = SCREEN_COORD(WINDOW_EDGE_PADDING, 0);
+            // Keep existing margins (user may have adjusted them)
+
+
             // Rewrap left terminal content for new width
             rewrap_terminal_content();
         }
         if (term_window_right) {
+            // FULL RESET: size, anchor, position (as if splitting fresh)
             term_window_right->size = WINDOW_SIZE(half_width, usable_height);
-            term_window_right->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                          TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+            term_window_right->anchor = ANCHOR_CENTER_RIGHT;
+            term_window_right->position = SCREEN_COORD(-WINDOW_EDGE_PADDING, 0);
+            // Keep margins synchronized with left terminal
+            term_window_right->text_margins = term_window->text_margins;
+            term_window_right->border_size = term_window->border_size;
+
         }
     } else if (split_vertical) {
-        // Recalculate vertical split sizes (top/bottom)
+        // Recalculate vertical split sizes (top/bottom) - COMPLETELY reset layout
         int usable_width = width - (WINDOW_EDGE_PADDING * 2);
         int usable_height = height - (WINDOW_EDGE_PADDING * 2);
         int half_height = (usable_height - TERMINAL_GAP) / 2;
 
+        int min_pane = (int)(term_window ? term_window->border_size.size * 4 : 32);
+        if (half_height < min_pane) half_height = min_pane;
+        if (usable_width < min_pane) usable_width = min_pane;
+
         if (term_window) {
+            // FULL RESET: size, anchor, position (as if splitting fresh)
             term_window->size = WINDOW_SIZE(usable_width, half_height);
-            term_window->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                    TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+            term_window->anchor = ANCHOR_TOP_CENTER;
+            term_window->position = SCREEN_COORD(0, WINDOW_EDGE_PADDING);
+            // Keep existing margins (user may have adjusted them)
+
+
             // Rewrap top terminal content for new height
             rewrap_terminal_content();
         }
         if (term_window_bottom) {
+            // FULL RESET: size, anchor, position (as if splitting fresh)
             term_window_bottom->size = WINDOW_SIZE(usable_width, half_height);
-            term_window_bottom->text_margins = TEXT_MARGINS(TEXT_MARGIN_LEFT, TEXT_MARGIN_RIGHT,
-                                                           TEXT_MARGIN_TOP, TEXT_MARGIN_BOTTOM);
+            term_window_bottom->anchor = ANCHOR_BOTTOM_CENTER;
+            term_window_bottom->position = SCREEN_COORD(0, -WINDOW_EDGE_PADDING);
+            // Keep margins synchronized with top terminal
+            term_window_bottom->text_margins = term_window->text_margins;
+            term_window_bottom->border_size = term_window->border_size;
+
         }
     } else {
-        // Single terminal mode
+        // Single terminal mode - ensure anchor/position are correct
         if (term_window) {
             term_window->size = WINDOW_SIZE(width - 40, height - 40);
+            term_window->anchor = ANCHOR_CENTER;  // Reset to center
+            term_window->position = SCREEN_COORD(0, 0);  // Reset to center position
+
+
             // Rewrap all text to fit new width
             rewrap_terminal_content();
         }
@@ -3014,7 +4137,7 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
     // Update OpenGL viewport
     glViewport(0, 0, width, height);
 
-    // Notify PTY of resize
+    // Notify PTY of resize - this updates TIOCSWINSZ for interactive programs
     resize_pty_to_window();
     if (split_horizontal) {
         resize_pty_to_window_right();
@@ -3022,20 +4145,36 @@ void window_resize_callback(GLFWwindow* window, int width, int height) {
         resize_pty_to_window_bottom();
     }
 
-    printf("Window resized to: %dx%d\n", width, height);
+    DEBUG_PRINT("Window resized to: %dx%d\n", width, height);
+}
+
+// GLFW error callback for debugging
+static void glfw_error_callback(int error, const char* description) {
+    fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    // Initialize GLFW
+    // Check DISPLAY environment variable
+    const char* display = getenv("DISPLAY");
+    if (!display || display[0] == '\0') {
+        fprintf(stderr, "Error: DISPLAY environment variable not set.\n");
+        fprintf(stderr, "If running over SSH, use: ssh -X user@host\n");
+        fprintf(stderr, "If running locally, ensure X11/Wayland is running.\n");
+        return -1;
+    }
+    printf("Using DISPLAY=%s\n", display);
+
+    // Initialize GLFW with error callback for debugging
+    glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
         return -1;
     }
 
-    // Create window
+    // Create window - try without version hints first for maximum compatibility
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);  // Enable resizing
@@ -3043,25 +4182,53 @@ int main(int argc, char** argv) {
     GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Terminal Emulator", NULL, NULL);
     if (!window) {
         fprintf(stderr, "Failed to create GLFW window\n");
+        fprintf(stderr, "Try running: glxinfo | grep 'OpenGL version' to check OpenGL support\n");
         glfwTerminate();
         return -1;
     }
 
     glfwMakeContextCurrent(window);
+    printf("OpenGL context created successfully\n");
+
+    // LOW LATENCY: Disable VSync for minimal input lag (trades screen tearing for responsiveness)
+    // Set to 1 for VSync (no tearing but +1 frame latency), 0 for no VSync (immediate, may tear)
+    glfwSwapInterval(0);  // 0 = maximum performance, lowest latency
+
     glfwSetKeyCallback(window, key_callback);
     glfwSetCharCallback(window, char_callback);
     glfwSetWindowSizeCallback(window, window_resize_callback);  // Add resize callback
     glfwSetMouseButtonCallback(window, mouse_button_callback);  // Add mouse button callback
     glfwSetCursorPosCallback(window, cursor_position_callback);  // Add mouse position callback
+    glfwSetScrollCallback(window, scroll_callback);  // Add scroll callback for mouse wheel
 
     // Initialize GLEW
+    // Required on Linux/Mesa to avoid "Unknown error" on glewInit
+    glewExperimental = GL_TRUE;
+
+    // Clear any existing GL errors before GLEW init
+    while (glGetError() != GL_NO_ERROR) {}
+
     GLenum err = glewInit();
     if (err != GLEW_OK) {
-        fprintf(stderr, "Failed to initialize GLEW: %s\n", glewGetErrorString(err));
-        return -1;
+        fprintf(stderr, "GLEW init returned error code: %d\n", err);
+        fprintf(stderr, "GLEW error string: %s\n", glewGetErrorString(err));
+
+        // Try to continue anyway if we have basic OpenGL - GLEW sometimes fails
+        // on indirect GLX (X11 forwarding) but basic GL functions still work
+        const char* gl_version = (const char*)glGetString(GL_VERSION);
+        if (gl_version) {
+            fprintf(stderr, "OpenGL reports version: %s - attempting to continue...\n", gl_version);
+        } else {
+            fprintf(stderr, "No OpenGL version available - cannot continue\n");
+            return -1;
+        }
     }
 
+    // Clear any GL errors generated by glewInit (common with glewExperimental)
+    while (glGetError() != GL_NO_ERROR) {}
+
     printf("OpenGL Version: %s\n", glGetString(GL_VERSION));
+    printf("OpenGL Renderer: %s\n", glGetString(GL_RENDERER));
 
     // Initialize window manager
     wm_init(&wm, SCREEN_SIZE(WINDOW_WIDTH, WINDOW_HEIGHT));
@@ -3100,6 +4267,19 @@ int main(int argc, char** argv) {
     // Initialize terminal
     terminal_init();
 
+    // Keep the window big enough for whatever layout is on screen.
+    apply_window_size_limits(window);
+
+    // Optional: the terminal runs fine with no audio device.
+    if (!sound_init(ENTER_SOUND_PATH)) {
+        printf("Sound disabled (no clip or no audio device)\n");
+    }
+
+    // bash is the default environment: bring it up straight away rather than
+    // making the user ask for it. If neither bash nor sh can start, the
+    // built-in line shell initialised above is still there as a fallback.
+    start_interactive_shell(NULL);
+
     printf("Terminal emulator started with font_basis33!\n");
     printf("Controls:\n");
     printf("  Ctrl+Q   - Exit terminal\n");
@@ -3111,21 +4291,49 @@ int main(int argc, char** argv) {
     // Main loop
     double last_time = glfwGetTime();
     while (!glfwWindowShouldClose(window)) {
+        // LOW LATENCY: Poll events FIRST to minimize input-to-frame delay
+        glfwPollEvents();
+
         double current_time = glfwGetTime();
         float delta_time = (float)(current_time - last_time);
         last_time = current_time;
 
-        // Update cursor blink for all terminals
+        // Update cursor blink for all terminals (both old and ANSI terminals)
         terminal.cursor_blink_timer += delta_time;
         if (terminal.cursor_blink_timer > 0.5f) {
-            terminal.cursor_visible = !terminal.cursor_visible;
             terminal.cursor_blink_timer = 0.0f;
+
+            // Toggle cursor for old terminal system
+            terminal.cursor_visible = !terminal.cursor_visible;
+
+            // Toggle cursor for ANSI terminals (used by interactive mode)
+            ansi_term.cursor_visible = !ansi_term.cursor_visible;
 
             // Also update split terminal cursors
             if (split_horizontal) {
                 terminal_right.cursor_visible = !terminal_right.cursor_visible;
+                ansi_term_right.cursor_visible = !ansi_term_right.cursor_visible;
             } else if (split_vertical) {
                 terminal_bottom.cursor_visible = !terminal_bottom.cursor_visible;
+                ansi_term_bottom.cursor_visible = !ansi_term_bottom.cursor_visible;
+            }
+        }
+
+        // The minimum window size depends on the split mode and the font
+        // size, both of which change from several places (menu items, F8/F9).
+        // Watching the resulting layout here reapplies the limit once for any
+        // of them, instead of hoping every call site remembers to.
+        {
+            static int last_layout = -1;
+            static float last_font_size = -1.0f;
+
+            int layout = (split_horizontal ? 1 : 0) | (split_vertical ? 2 : 0);
+            float font_now = term_window ? term_window->font_size.value : 1.0f;
+
+            if (layout != last_layout || font_now != last_font_size) {
+                last_layout = layout;
+                last_font_size = font_now;
+                apply_window_size_limits(window);
             }
         }
 
@@ -3160,10 +4368,11 @@ int main(int argc, char** argv) {
         render_context_menu();
 
         glfwSwapBuffers(window);
-        glfwPollEvents();
+        // Note: glfwPollEvents() moved to top of loop for lower latency
     }
 
     // Cleanup
+    sound_shutdown();
     wm_cleanup(&wm);
     glfwDestroyWindow(window);
     glfwTerminate();
